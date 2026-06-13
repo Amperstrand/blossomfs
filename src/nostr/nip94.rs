@@ -86,10 +86,8 @@ fn parse_nip94_from_tags(tags: &[Vec<&str>]) -> FileMeta {
             "x" => {
                 meta.sha256 = Some(tag[1].to_string());
             }
-            "ox" => {
-                if meta.sha256.is_none() {
-                    meta.sha256 = Some(tag[1].to_string());
-                }
+            "ox" if meta.sha256.is_none() => {
+                meta.sha256 = Some(tag[1].to_string());
             }
             "url" => {
                 meta.url = Some(tag[1].to_string());

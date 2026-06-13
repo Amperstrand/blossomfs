@@ -90,22 +90,18 @@ fn parse_drive_from_tags(tags: &[Vec<&str>]) -> ParsedDrive {
             continue;
         }
         match tag[0] {
-            "d" => {
-                if tag.len() >= 2 {
-                    drive_id = tag[1].to_string();
-                }
+            "d" if tag.len() >= 2 => {
+                drive_id = tag[1].to_string();
             }
             "x" => {
                 if let Some(file) = parse_x_tag(tag) {
                     entries.push(DriveEntry::File(file));
                 }
             }
-            "folder" => {
-                if tag.len() >= 2 {
-                    entries.push(DriveEntry::Folder(DriveFolder {
-                        path: tag[1].to_string(),
-                    }));
-                }
+            "folder" if tag.len() >= 2 => {
+                entries.push(DriveEntry::Folder(DriveFolder {
+                    path: tag[1].to_string(),
+                }));
             }
             _ => {}
         }
