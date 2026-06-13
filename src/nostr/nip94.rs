@@ -30,8 +30,8 @@ pub async fn fetch_nip94_events(
     relays: &[String],
     pubkey_hex: &str,
 ) -> Result<Vec<FileMeta>, Nip94Error> {
-    let public_key = PublicKey::from_hex(pubkey_hex)
-        .map_err(|e| Nip94Error::InvalidPubkey(e.to_string()))?;
+    let public_key =
+        PublicKey::from_hex(pubkey_hex).map_err(|e| Nip94Error::InvalidPubkey(e.to_string()))?;
 
     let client = Client::default();
     for relay_url in relays {
@@ -39,9 +39,7 @@ pub async fn fetch_nip94_events(
     }
     client.connect().await;
 
-    let filter = Filter::new()
-        .kind(Kind::Custom(1063))
-        .author(public_key);
+    let filter = Filter::new().kind(Kind::Custom(1063)).author(public_key);
 
     let events = client
         .fetch_events(filter)
@@ -136,11 +134,17 @@ mod tests {
         let meta = parse_nip94_from_tags(&tags);
 
         assert_eq!(meta.sha256.as_deref(), Some("abc123def456"));
-        assert_eq!(meta.url.as_deref(), Some("https://cdn.example.com/abc123.png"));
+        assert_eq!(
+            meta.url.as_deref(),
+            Some("https://cdn.example.com/abc123.png")
+        );
         assert_eq!(meta.mime_type.as_deref(), Some("image/png"));
         assert_eq!(meta.size, Some(1048576));
         assert_eq!(meta.dim.as_deref(), Some("1920x1080"));
-        assert_eq!(meta.blurhash.as_deref(), Some("LEHV6nWB2yk8pyo0adR*.7kCMdnj"));
+        assert_eq!(
+            meta.blurhash.as_deref(),
+            Some("LEHV6nWB2yk8pyo0adR*.7kCMdnj")
+        );
         assert_eq!(meta.alt.as_deref(), Some("A beautiful sunset"));
     }
 
@@ -163,10 +167,7 @@ mod tests {
 
     #[test]
     fn test_parse_x_takes_priority_over_ox() {
-        let tags = vec![
-            vec!["ox", "originalhash"],
-            vec!["x", "verifiedhash"],
-        ];
+        let tags = vec![vec!["ox", "originalhash"], vec!["x", "verifiedhash"]];
         let meta = parse_nip94_from_tags(&tags);
         assert_eq!(meta.sha256.as_deref(), Some("verifiedhash"));
     }
@@ -181,10 +182,7 @@ mod tests {
 
     #[test]
     fn test_parse_invalid_size_treated_as_none() {
-        let tags = vec![
-            vec!["x", "hash"],
-            vec!["size", "not-a-number"],
-        ];
+        let tags = vec![vec!["x", "hash"], vec!["size", "not-a-number"]];
         let meta = parse_nip94_from_tags(&tags);
         assert_eq!(meta.sha256.as_deref(), Some("hash"));
         assert_eq!(meta.size, None);
@@ -204,10 +202,7 @@ mod tests {
 
     #[test]
     fn test_parse_short_tag_skipped() {
-        let tags = vec![
-            vec!["x"],
-            vec!["url"],
-        ];
+        let tags = vec![vec!["x"], vec!["url"]];
         let meta = parse_nip94_from_tags(&tags);
         assert!(meta.sha256.is_none());
         assert!(meta.url.is_none());
@@ -215,10 +210,7 @@ mod tests {
 
     #[test]
     fn test_parse_multiple_events_independent() {
-        let tags1 = vec![
-            vec!["x", "hash1"],
-            vec!["m", "image/png"],
-        ];
+        let tags1 = vec![vec!["x", "hash1"], vec!["m", "image/png"]];
         let tags2 = vec![
             vec!["x", "hash2"],
             vec!["m", "video/mp4"],

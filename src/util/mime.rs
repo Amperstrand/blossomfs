@@ -10,9 +10,33 @@ use mime_guess::mime;
 ///
 /// Returns Some(extension) for known MIME types, None for octet-stream or unknown.
 #[allow(dead_code)]
+fn preferred_extension(mime_type: &str) -> Option<String> {
+    match mime_type {
+        "text/plain" => Some("txt".to_string()),
+        "text/html" => Some("html".to_string()),
+        "text/css" => Some("css".to_string()),
+        "text/javascript" | "application/javascript" => Some("js".to_string()),
+        "application/json" => Some("json".to_string()),
+        "application/xml" | "text/xml" => Some("xml".to_string()),
+        "image/jpeg" => Some("jpg".to_string()),
+        "image/svg+xml" => Some("svg".to_string()),
+        "audio/mpeg" => Some("mp3".to_string()),
+        "video/mp4" => Some("mp4".to_string()),
+        "video/webm" => Some("webm".to_string()),
+        "application/zip" => Some("zip".to_string()),
+        "application/gzip" => Some("gz".to_string()),
+        "application/x-tar" => Some("tar".to_string()),
+        _ => None,
+    }
+}
+
 pub fn mime_to_extension(mime_type: &str) -> Option<String> {
     if mime_type.is_empty() {
         return None;
+    }
+
+    if let Some(ext) = preferred_extension(mime_type) {
+        return Some(ext);
     }
 
     let mime_type: mime::Mime = mime_type.parse().ok()?;
@@ -101,8 +125,20 @@ mod tests {
     fn test_mime_to_extension_jpeg() {
         let ext = mime_to_extension("image/jpeg");
         assert!(ext.is_some());
-        let ext_str = ext.unwrap();
-        assert!(ext_str == "jfif" || ext_str == "jpeg");
+        assert_eq!(ext.unwrap(), "jpg");
+    }
+
+    #[test]
+    fn test_mime_to_extension_text_plain() {
+        assert_eq!(mime_to_extension("text/plain"), Some("txt".to_string()));
+    }
+
+    #[test]
+    fn test_mime_to_extension_json() {
+        assert_eq!(
+            mime_to_extension("application/json"),
+            Some("json".to_string())
+        );
     }
 
     // extension_for_descriptor tests

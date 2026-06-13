@@ -44,8 +44,8 @@ pub async fn fetch_drive_events(
     relays: &[String],
     pubkey_hex: &str,
 ) -> Result<Vec<ParsedDrive>, DriveError> {
-    let public_key = PublicKey::from_hex(pubkey_hex)
-        .map_err(|e| DriveError::InvalidPubkey(e.to_string()))?;
+    let public_key =
+        PublicKey::from_hex(pubkey_hex).map_err(|e| DriveError::InvalidPubkey(e.to_string()))?;
 
     let client = Client::default();
     for relay_url in relays {
@@ -53,9 +53,7 @@ pub async fn fetch_drive_events(
     }
     client.connect().await;
 
-    let filter = Filter::new()
-        .kind(Kind::Custom(30563))
-        .author(public_key);
+    let filter = Filter::new().kind(Kind::Custom(30563)).author(public_key);
 
     let events = client
         .fetch_events(filter)
@@ -220,30 +218,21 @@ mod tests {
 
     #[test]
     fn test_parse_x_tag_missing_path() {
-        let tags = vec![
-            vec!["d", "d"],
-            vec!["x", "hash123", "", "10"],
-        ];
+        let tags = vec![vec!["d", "d"], vec!["x", "hash123", "", "10"]];
         let drive = parse_drive_from_tags(&tags);
         assert!(drive.entries.is_empty());
     }
 
     #[test]
     fn test_parse_x_tag_too_short() {
-        let tags = vec![
-            vec!["d", "d"],
-            vec!["x", "only-sha"],
-        ];
+        let tags = vec![vec!["d", "d"], vec!["x", "only-sha"]];
         let drive = parse_drive_from_tags(&tags);
         assert!(drive.entries.is_empty());
     }
 
     #[test]
     fn test_parse_x_tag_no_size_no_mime() {
-        let tags = vec![
-            vec!["d", "d"],
-            vec!["x", "sha", "/file.bin"],
-        ];
+        let tags = vec![vec!["d", "d"], vec!["x", "sha", "/file.bin"]];
         let drive = parse_drive_from_tags(&tags);
         assert_eq!(drive.entries.len(), 1);
         match &drive.entries[0] {
@@ -291,14 +280,8 @@ mod tests {
 
     #[test]
     fn test_parse_multiple_drives_separate() {
-        let tags1 = vec![
-            vec!["d", "drive-a"],
-            vec!["x", "h1", "/a.txt", "1"],
-        ];
-        let tags2 = vec![
-            vec!["d", "drive-b"],
-            vec!["x", "h2", "/b.txt", "2"],
-        ];
+        let tags1 = vec![vec!["d", "drive-a"], vec!["x", "h1", "/a.txt", "1"]];
+        let tags2 = vec![vec!["d", "drive-b"], vec!["x", "h2", "/b.txt", "2"]];
         let d1 = parse_drive_from_tags(&tags1);
         let d2 = parse_drive_from_tags(&tags2);
         assert_eq!(d1.drive_id, "drive-a");

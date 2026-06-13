@@ -28,9 +28,7 @@ pub async fn discover_servers(
     }
     client.connect().await;
 
-    let filter = Filter::new()
-        .kind(Kind::Custom(10063))
-        .author(public_key);
+    let filter = Filter::new().kind(Kind::Custom(10063)).author(public_key);
 
     let events = client
         .fetch_events(filter)
@@ -41,13 +39,7 @@ pub async fn discover_servers(
 
     let raw_tags: Vec<(&str, Option<&str>)> = events
         .first()
-        .map(|event| {
-            event
-                .tags
-                .iter()
-                .map(|t| (t.kind(), t.content()))
-                .collect()
-        })
+        .map(|event| event.tags.iter().map(|t| (t.kind(), t.content())).collect())
         .unwrap_or_default();
 
     let servers = extract_server_urls(&raw_tags);
@@ -97,10 +89,7 @@ mod tests {
 
     #[test]
     fn test_extract_no_server_tags() {
-        let tags = vec![
-            ("name", Some("my-server")),
-            ("about", Some("media server")),
-        ];
+        let tags = vec![("name", Some("my-server")), ("about", Some("media server"))];
         let result = extract_server_urls(&tags);
         assert!(result.is_empty());
     }
@@ -144,10 +133,7 @@ mod tests {
         let result = extract_server_urls(&tags);
         assert_eq!(
             result,
-            vec![
-                "https://real.example.com",
-                "https://backup.example.com",
-            ]
+            vec!["https://real.example.com", "https://backup.example.com",]
         );
     }
 }
