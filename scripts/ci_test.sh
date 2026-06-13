@@ -35,16 +35,17 @@ nak_auth() {
 cashu_send() {
   local amount="$1"
   cashu -h "$MINT" -w "$CASHU_WALLET" -u sat -y send "$amount" 2>/dev/null \
-    | grep "^cashu" | head -1
+    | grep "^cashu" | head -1 || true
 }
 
 ensure_cashu_balance() {
   local balance
-  balance=$(cashu -h "$MINT" -w "$CASHU_WALLET" -u sat -y balance 2>/dev/null | head -1)
+  balance=$(cashu -h "$MINT" -w "$CASHU_WALLET" -u sat -y balance 2>/dev/null | head -1 || true)
   balance=$(echo "$balance" | grep -oP '\d+' || echo "0")
   if [ "$balance" -lt 50 ]; then
     info "Low balance ($balance sat), minting 1000 sat from test mint..."
-    cashu -h "$MINT" -w "$CASHU_WALLET" -u sat -y invoice 1000 >/dev/null 2>&1
+    cashu -h "$MINT" -w "$CASHU_WALLET" -u sat -y invoice 1000 >/dev/null 2>&1 \
+      || fail "Failed to mint test ecash from $MINT (check mint availability)"
   fi
 }
 
@@ -178,7 +179,7 @@ BLOB_COUNT=$(find "$MOUNTPOINT" -type f -name "$(echo "$SMALL_HASH" | cut -c1-8)
 info "Found $BLOB_COUNT small blobs in mount"
 
 # Verify small file
-SMALL_FUSE=$(find "$MOUNTPOINT" -type f -name "${SMALL_HASH:0:16}*" | head -1)
+SMALL_FUSE=$(find "$MOUNTPOINT" -type f -name "${SMALL_HASH:0:16}*" | head -1 || true)
 if [ -n "$SMALL_FUSE" ]; then
   FUSE_HASH=$(sha256sum "$SMALL_FUSE" | cut -d' ' -f1)
   [ "$FUSE_HASH" = "$SMALL_HASH" ] && pass "Small blob SHA-256 verified through FUSE" || fail "Small blob hash mismatch"
@@ -187,7 +188,7 @@ else
 fi
 
 # Verify large file
-LARGE_FUSE=$(find "$MOUNTPOINT" -type f -name "${LARGE_HASH:0:16}*" | head -1)
+LARGE_FUSE=$(find "$MOUNTPOINT" -type f -name "${LARGE_HASH:0:16}*" | head -1 || true)
 if [ -n "$LARGE_FUSE" ]; then
   FUSE_HASH=$(sha256sum "$LARGE_FUSE" | cut -d' ' -f1)
   [ "$FUSE_HASH" = "$LARGE_HASH" ] && pass "Large blob SHA-256 verified through FUSE" || fail "Large blob hash mismatch"
