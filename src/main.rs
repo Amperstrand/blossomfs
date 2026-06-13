@@ -18,6 +18,7 @@ use clap::Parser;
 use fuser::MountOption;
 
 use crate::blossom::client::BlossomClient;
+use crate::blossom::descriptor::BlobDescriptor;
 use crate::blossom::manifest::load_manifest;
 use crate::cli::{Cli, Command};
 use crate::fuse::fs::BlossomFS;
@@ -62,6 +63,11 @@ fn add_drive_file(
     mime: Option<&str>,
     servers: &[String],
 ) {
+    if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        tracing::warn!("skipping drive file with invalid sha256: {}", sha256);
+        return;
+    }
+
     let trimmed = path.trim_start_matches('/');
     let parts: Vec<&str> = trimmed.split('/').collect();
     if parts.is_empty() {
@@ -171,9 +177,23 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Manifest source: /public/local/servers/manifest/ ---
     if let Some(ref manifest_path) = args.manifest {
-        let descriptors = load_manifest(manifest_path)?;
+        let raw = load_manifest(manifest_path)?;
+        let descriptors: Vec<BlobDescriptor> = raw
+            .into_iter()
+            .filter(|d| {
+                if let Err(e) = d.validate() {
+                    tracing::warn!("skipping invalid descriptor (sha={}): {}", d.sha256, e);
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
         blob_count += descriptors.len();
-        tracing::info!("loaded {} descriptors from manifest", descriptors.len());
+        tracing::info!(
+            "loaded {} valid descriptors from manifest",
+            descriptors.len()
+        );
 
         if let Some(pd) = public_dir {
             let local_dir = tree.add_directory(pd, "local");
@@ -198,7 +218,22 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
                 let client = BlossomClient::new(server_url);
                 tracing::info!("listing blobs from {} for pubkey={}", server_url, pk_label);
                 match rt.block_on(client.list_all_blobs(pk_label)) {
-                    Ok(descriptors) => {
+                    Ok(raw) => {
+                        let descriptors: Vec<BlobDescriptor> = raw
+                            .into_iter()
+                            .filter(|d| {
+                                if let Err(e) = d.validate() {
+                                    tracing::warn!(
+                                        "skipping invalid descriptor from {}: {}",
+                                        server_url,
+                                        e
+                                    );
+                                    false
+                                } else {
+                                    true
+                                }
+                            })
+                            .collect();
                         tracing::info!("listed {} blobs from {}", descriptors.len(), server_url);
                         blob_count += descriptors.len();
                         all_descriptors.extend(descriptors.clone());

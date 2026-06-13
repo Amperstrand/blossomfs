@@ -8,20 +8,29 @@ Blossom is a media storage layer built on top of Nostr. Blobs are identified by 
 
 ## What works now
 
-**M0 -- Read-only mount.** Mount a Blossom server or manifest as a local directory. The filesystem rejects all write operations. Files appear as they would on the remote server.
+**M0 -- Research and design.** Validated all Blossom BUD specs, Nostr NIPs, and FUSE library APIs against primary sources. Design documents in `docs/`.
 
-**M1 -- Manifest mode.** Point BlossomFS at a JSON file of BUD-02 blob descriptors instead of a live server. Useful for testing, offline work, and scripted workflows. See `examples/manifest.json` for the expected format.
+**M1 -- Read-only mount.** Mount a Blossom server or manifest as a local directory. The filesystem rejects all write operations. Files appear as they would on the remote server.
 
 **M2 -- BUD-12 listing.** When the server supports the `/list` endpoint (BUD-12), BlossomFS fetches the full blob index at mount time and presents every listed blob as a file.
 
 **M3 -- Lazy fetch, cache, and hash verification.** Blobs are not downloaded until you open them. Once fetched, they are cached locally. Every download is verified against its SHA-256 hash. Corrupted or tampered content is rejected.
 
+**M4 -- Relay-based server discovery (NIP-B7/BUD-03).** Provide `--relay wss://...` and BlossomFS queries kind 10063 events to discover Blossom servers automatically. No `--server` flag needed.
+
+**M5 -- Legacy Blossom Drive (kind 30563).** Read-only exposure of old Blossom Drive folder structures. Drive paths appear under `/drives/<pubkey>/<drive-id>/...`. Path traversal and untrusted input are sanitized.
+
+**M6 -- NIP-94 file metadata (kind 1063).** File metadata events are exposed as JSON sidecars under `/metadata/<sha256>.json`. SHA-256 values from relay events are validated before use.
+
+**M7 -- Append-only drive design.** A design document for a future append-only drive namespace (replacing the deprecated single-replaceable-event model) is in `docs/append-only-drive-spec-draft.md`.
+
 ## What doesn't work yet
 
 - No writes, uploads, or deletes
 - No rename or move operations
-- No Blossom Drive namespace support
 - No Nostr event signing or publishing
+- No BUD-11 authenticated operations (auth tokens)
+- Append-only drive namespace (M7) is designed but not implemented
 
 ## Why read-only first?
 
