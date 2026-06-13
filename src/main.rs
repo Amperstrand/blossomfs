@@ -25,6 +25,8 @@ use crate::fuse::tree::Tree;
 use crate::fuse::vfiles::{MountInfo, generate_readme, generate_status};
 use crate::nostr::discovery::discover_servers;
 use crate::nostr::keys::parse_npub;
+use crate::nostr::legacy_drive::{DriveEntry, fetch_drive_events};
+use crate::nostr::nip94::fetch_nip94_events;
 use crate::util::path::sanitize_hostname;
 
 fn resolve_pubkey_hex(args: &cli::MountArgs) -> Option<String> {
@@ -37,6 +39,60 @@ fn resolve_pubkey_hex(args: &cli::MountArgs) -> Option<String> {
         }
     }
     None
+}
+
+fn ensure_drive_path(tree: &mut Tree, root: u64, path: &str) -> u64 {
+    let trimmed = path.trim_start_matches('/');
+    let mut current = root;
+    for component in trimmed.split('/') {
+        if component.is_empty() {
+            continue;
+        }
+        current = tree.get_or_create_dir(current, component);
+    }
+    current
+}
+
+fn add_drive_file(
+    tree: &mut Tree,
+    root: u64,
+    path: &str,
+    sha256: &str,
+    size: u64,
+    mime: Option<&str>,
+    servers: &[String],
+) {
+    let trimmed = path.trim_start_matches('/');
+    let parts: Vec<&str> = trimmed.split('/').collect();
+    if parts.is_empty() {
+        return;
+    }
+
+    let mut current = root;
+    for dir in &parts[..parts.len().saturating_sub(1)] {
+        if dir.is_empty() {
+            continue;
+        }
+        current = tree.get_or_create_dir(current, dir);
+    }
+
+    if let Some(&filename) = parts.last() {
+        if filename.is_empty() {
+            return;
+        }
+        let url = servers
+            .first()
+            .map(|s| format!("{}/{}", s.trim_end_matches('/'), sha256))
+            .unwrap_or_else(|| format!("blossom://{}", sha256));
+        tree.add_remote_file(
+            current,
+            filename,
+            url,
+            sha256.to_string(),
+            size,
+            mime.map(|s| s.to_string()),
+        );
+    }
 }
 
 fn main() {
@@ -164,6 +220,72 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
             if !all_descriptors.is_empty() {
                 let all_dir = tree.add_directory(pubkey_dir, "all-servers");
                 tree.build_by_sha256_only(all_dir, &all_descriptors);
+            }
+        }
+    }
+
+    // --- Drive sources: /drives/<pubkey>/<drive-id>/... (kind 30563) ---
+    if !args.relay.is_empty() {
+        if let Some(ref pk) = pubkey_hex {
+            match rt.block_on(fetch_drive_events(&args.relay, pk)) {
+                Ok(drives) => {
+                    tracing::info!("fetched {} drive(s) via kind 30563", drives.len());
+                    let drives_root = tree.add_directory(tree.root(), "drives");
+                    let pk_dir = tree.add_directory(drives_root, pk);
+
+                    for drive in &drives {
+                        let drive_inode = tree.add_directory(pk_dir, &drive.drive_id);
+                        for entry in &drive.entries {
+                            match entry {
+                                DriveEntry::File(f) => {
+                                    add_drive_file(
+                                        &mut tree,
+                                        drive_inode,
+                                        &f.path,
+                                        &f.sha256,
+                                        f.size.unwrap_or(0),
+                                        f.mime.as_deref(),
+                                        &effective_servers,
+                                    );
+                                    blob_count += 1;
+                                }
+                                DriveEntry::Folder(fl) => {
+                                    ensure_drive_path(&mut tree, drive_inode, &fl.path);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("drive fetch via relays failed: {}", e);
+                }
+            }
+        }
+    }
+
+    // --- NIP-94 metadata: /metadata/<sha256>.json (kind 1063) ---
+    if !args.relay.is_empty() {
+        if let Some(ref pk) = pubkey_hex {
+            match rt.block_on(fetch_nip94_events(&args.relay, pk)) {
+                Ok(metas) => {
+                    tracing::info!("fetched {} NIP-94 metadata events", metas.len());
+                    let meta_root = tree.add_directory(tree.root(), "metadata");
+                    for meta in &metas {
+                        if let Some(ref sha) = meta.sha256 {
+                            let json = serde_json::to_string_pretty(meta)
+                                .unwrap_or_default()
+                                .into_bytes();
+                            tree.add_static_file(
+                                meta_root,
+                                &format!("{}.json", sha),
+                                json,
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("NIP-94 fetch via relays failed: {}", e);
+                }
             }
         }
     }

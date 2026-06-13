@@ -247,7 +247,7 @@ impl Tree {
     }
 
     /// Look up a directory by name, creating it if it does not exist.
-    fn get_or_create_dir(&mut self, parent: u64, name: &str) -> u64 {
+    pub fn get_or_create_dir(&mut self, parent: u64, name: &str) -> u64 {
         if let Some(child_ino) = self.lookup(parent, name) {
             return child_ino;
         }
