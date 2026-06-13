@@ -18,3 +18,639 @@
 //!       all-servers/
 //!         by-sha256/<sha256>[.<ext>]
 //! ```
+
+#![allow(dead_code)]
+
+use std::collections::HashSet;
+
+use crate::blossom::descriptor::BlobDescriptor;
+use crate::util::mime::extension_for_descriptor;
+use crate::util::path::{sanitize_mime_for_path, sanitize_path_component, sanitize_sha256};
+
+/// Kind of node in the virtual tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeKind {
+    Directory,
+    File,
+}
+
+/// What backs a file's content.
+#[derive(Debug, Clone)]
+pub enum FileContent {
+    /// Inline static content (e.g. README text).
+    Static(Vec<u8>),
+    /// Content fetched from a remote blob server on demand.
+    Remote {
+        url: String,
+        sha256: String,
+        mime_type: Option<String>,
+    },
+}
+
+/// A node in the virtual filesystem tree.
+#[derive(Debug, Clone)]
+pub enum TreeNode {
+    Directory {
+        ino: u64,
+        name: String,
+        children: Vec<u64>,
+        parent: u64,
+    },
+    File {
+        ino: u64,
+        name: String,
+        parent: u64,
+        size: u64,
+        content: FileContent,
+    },
+}
+
+/// The virtual filesystem tree.
+///
+/// Stores all nodes in a `Vec` indexed by inode (1-based). Root inode is
+/// always 1. The tree is built once at mount time and not mutated during
+/// the session (except during initial construction).
+#[derive(Debug)]
+pub struct Tree {
+    nodes: Vec<TreeNode>,
+    root: u64,
+}
+
+impl Tree {
+    /// Create a new tree containing only the root directory (inode 1).
+    pub fn new() -> Self {
+        Tree {
+            nodes: vec![TreeNode::Directory {
+                ino: 1,
+                name: String::from("/"),
+                children: Vec::new(),
+                parent: 0,
+            }],
+            root: 1,
+        }
+    }
+
+    /// Returns the root inode (always 1).
+    pub fn root(&self) -> u64 {
+        self.root
+    }
+
+    /// Get a node reference by inode number.
+    pub fn get(&self, ino: u64) -> Option<&TreeNode> {
+        if ino >= 1 {
+            self.nodes.get((ino - 1) as usize)
+        } else {
+            None
+        }
+    }
+
+    /// Get a mutable node reference by inode number (internal helper).
+    fn get_mut(&mut self, ino: u64) -> Option<&mut TreeNode> {
+        if ino >= 1 {
+            self.nodes.get_mut((ino - 1) as usize)
+        } else {
+            None
+        }
+    }
+
+    /// Find a child inode by name within a directory.
+    ///
+    /// Returns `None` if `parent` is not a directory or no child with
+    /// the given name exists.
+    pub fn lookup(&self, parent: u64, name: &str) -> Option<u64> {
+        let node = self.get(parent)?;
+        let children = match node {
+            TreeNode::Directory { children, .. } => children,
+            TreeNode::File { .. } => return None,
+        };
+        for &child_ino in children {
+            let child = self.get(child_ino)?;
+            let child_name = match child {
+                TreeNode::Directory { name, .. } => name.as_str(),
+                TreeNode::File { name, .. } => name.as_str(),
+            };
+            if child_name == name {
+                return Some(child_ino);
+            }
+        }
+        None
+    }
+
+    /// List entries in a directory.
+    ///
+    /// Returns `None` if `ino` is not a directory.
+    /// Otherwise returns `Some(Vec)` of `(child_ino, name, kind)`.
+    pub fn readdir(&self, ino: u64) -> Option<Vec<(u64, String, NodeKind)>> {
+        let node = self.get(ino)?;
+        let children = match node {
+            TreeNode::Directory { children, .. } => children,
+            TreeNode::File { .. } => return None,
+        };
+        let mut result = Vec::with_capacity(children.len());
+        for &child_ino in children {
+            let child = self.get(child_ino)?;
+            let (name, kind) = match child {
+                TreeNode::Directory { name, .. } => (name.clone(), NodeKind::Directory),
+                TreeNode::File { name, .. } => (name.clone(), NodeKind::File),
+            };
+            result.push((child_ino, name, kind));
+        }
+        Some(result)
+    }
+
+    /// Get the kind (Directory or File) of a node.
+    pub fn kind(&self, ino: u64) -> Option<NodeKind> {
+        match self.get(ino)? {
+            TreeNode::Directory { .. } => Some(NodeKind::Directory),
+            TreeNode::File { .. } => Some(NodeKind::File),
+        }
+    }
+
+    /// Get the size of a node.
+    ///
+    /// Returns `Some(0)` for directories, `Some(size)` for files,
+    /// or `None` if the inode does not exist.
+    pub fn size(&self, ino: u64) -> Option<u64> {
+        match self.get(ino)? {
+            TreeNode::Directory { .. } => Some(0),
+            TreeNode::File { size, .. } => Some(*size),
+        }
+    }
+
+    /// Allocate the next inode number.
+    fn next_ino(&self) -> u64 {
+        (self.nodes.len() + 1) as u64
+    }
+
+    /// Add a directory under `parent`, returning its new inode.
+    pub fn add_directory(&mut self, parent: u64, name: &str) -> u64 {
+        let sanitized = sanitize_path_component(name);
+        let ino = self.next_ino();
+        self.nodes.push(TreeNode::Directory {
+            ino,
+            name: sanitized,
+            children: Vec::new(),
+            parent,
+        });
+        if let Some(TreeNode::Directory { children, .. }) = self.get_mut(parent) {
+            children.push(ino);
+        }
+        ino
+    }
+
+    /// Add a file with static content under `parent`.
+    pub fn add_static_file(&mut self, parent: u64, name: &str, content: Vec<u8>) -> u64 {
+        let sanitized = sanitize_path_component(name);
+        let size = content.len() as u64;
+        let ino = self.next_ino();
+        self.nodes.push(TreeNode::File {
+            ino,
+            name: sanitized,
+            parent,
+            size,
+            content: FileContent::Static(content),
+        });
+        if let Some(TreeNode::Directory { children, .. }) = self.get_mut(parent) {
+            children.push(ino);
+        }
+        ino
+    }
+
+    /// Add a file backed by a remote blob.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_remote_file(
+        &mut self,
+        parent: u64,
+        name: &str,
+        url: String,
+        sha256: String,
+        size: u64,
+        mime_type: Option<String>,
+    ) -> u64 {
+        let sanitized = sanitize_path_component(name);
+        let ino = self.next_ino();
+        self.nodes.push(TreeNode::File {
+            ino,
+            name: sanitized,
+            parent,
+            size,
+            content: FileContent::Remote {
+                url,
+                sha256,
+                mime_type,
+            },
+        });
+        if let Some(TreeNode::Directory { children, .. }) = self.get_mut(parent) {
+            children.push(ino);
+        }
+        ino
+    }
+
+    /// Look up a directory by name, creating it if it does not exist.
+    fn get_or_create_dir(&mut self, parent: u64, name: &str) -> u64 {
+        if let Some(child_ino) = self.lookup(parent, name) {
+            return child_ino;
+        }
+        self.add_directory(parent, name)
+    }
+
+    /// Build by-sha256, by-type, and by-date subtrees from blob descriptors.
+    ///
+    /// Descriptors with invalid sha256 are silently skipped.
+    /// In `by-sha256/`, each unique sha256 appears exactly once.
+    pub fn build_from_descriptors(&mut self, parent: u64, descriptors: &[BlobDescriptor]) {
+        let by_sha = self.add_directory(parent, "by-sha256");
+        let by_type = self.add_directory(parent, "by-type");
+        let by_date = self.add_directory(parent, "by-date");
+
+        let mut seen: HashSet<String> = HashSet::new();
+
+        for desc in descriptors {
+            // Validate sha256; skip invalid descriptors.
+            let sha = match sanitize_sha256(&desc.sha256) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            // Determine file extension from MIME type or URL.
+            let ext = extension_for_descriptor(desc.mime_type.as_deref(), &desc.url);
+            let file_name = if ext.is_empty() {
+                sha.clone()
+            } else {
+                format!("{}.{}", sha, ext)
+            };
+
+            // by-sha256 — deduplicate by sha256.
+            if seen.insert(sha.clone()) {
+                self.add_remote_file(
+                    by_sha,
+                    &file_name,
+                    desc.url.clone(),
+                    sha.clone(),
+                    desc.size,
+                    desc.mime_type.clone(),
+                );
+            }
+
+            // by-type — group under sanitized MIME directory.
+            let mime = desc.effective_mime_type();
+            let mime_dir_name = sanitize_mime_for_path(mime);
+            let type_dir = self.get_or_create_dir(by_type, &mime_dir_name);
+            self.add_remote_file(
+                type_dir,
+                &file_name,
+                desc.url.clone(),
+                sha.clone(),
+                desc.size,
+                desc.mime_type.clone(),
+            );
+
+            // by-date — group under YYYY/MM/DD.
+            let (year, month, day) = unix_to_ymd(desc.uploaded);
+            let year_dir = self.get_or_create_dir(by_date, &format!("{year:04}"));
+            let month_dir = self.get_or_create_dir(year_dir, &format!("{month:02}"));
+            let day_dir = self.get_or_create_dir(month_dir, &format!("{day:02}"));
+            self.add_remote_file(
+                day_dir,
+                &file_name,
+                desc.url.clone(),
+                sha,
+                desc.size,
+                desc.mime_type.clone(),
+            );
+        }
+    }
+}
+
+impl Default for Tree {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Convert a Unix timestamp to (year, month, day) in the proleptic Gregorian
+/// calendar using Howard Hinnant's civil-from-days algorithm.
+///
+/// No external date crate required.
+fn unix_to_ymd(ts: u64) -> (u32, u32, u32) {
+    let days = (ts / 86400) as i64;
+    let z = days + 719468;
+    let era = if z >= 0 {
+        z / 146097
+    } else {
+        (z - 146096) / 146097
+    };
+    let doe = (z - era * 146097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if m <= 2 { y + 1 } else { y };
+    (year as u32, m as u32, d as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: 64-char hex sha256 strings for test data.
+    const SHA_A: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    const SHA_B: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const SHA_C: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    /// Helper: build a descriptor.
+    fn mk_desc(sha: &str, mime: Option<&str>, uploaded: u64) -> BlobDescriptor {
+        BlobDescriptor {
+            url: format!("https://cdn.example.com/{}", sha),
+            sha256: sha.to_string(),
+            size: 100,
+            mime_type: mime.map(|s| s.to_string()),
+            uploaded,
+        }
+    }
+
+    // ============== Scenario 1: new() creates root at ino=1 ==============
+
+    #[test]
+    fn s01_new_has_root_inode_1() {
+        let tree = Tree::new();
+        assert_eq!(tree.root(), 1);
+        let node = tree.get(1).expect("root should exist");
+        assert_eq!(tree.kind(1), Some(NodeKind::Directory));
+        match node {
+            TreeNode::Directory { name, children, .. } => {
+                assert!(
+                    children.is_empty(),
+                    "root should have no children initially"
+                );
+                let _ = name;
+            }
+            TreeNode::File { .. } => panic!("root must be a directory"),
+        }
+    }
+
+    // ============== Scenario 2: add_directory returns inode, lookup finds it ==============
+
+    #[test]
+    fn s02_add_directory_and_lookup() {
+        let mut tree = Tree::new();
+        let ino = tree.add_directory(1, "test");
+        assert_eq!(ino, 2, "first directory after root should be inode 2");
+        assert_eq!(tree.lookup(1, "test"), Some(2));
+        assert_eq!(tree.kind(2), Some(NodeKind::Directory));
+    }
+
+    // ============== Scenario 3: add_static_file content is readable ==============
+
+    #[test]
+    fn s03_add_static_file_readable() {
+        let mut tree = Tree::new();
+        let ino = tree.add_static_file(1, "README.txt", b"hello".to_vec());
+        assert_eq!(tree.lookup(1, "README.txt"), Some(ino));
+        match tree.get(ino).unwrap() {
+            TreeNode::File { size, content, .. } => {
+                assert_eq!(*size, 5);
+                match content {
+                    FileContent::Static(data) => assert_eq!(data, b"hello"),
+                    FileContent::Remote { .. } => panic!("expected Static content"),
+                }
+            }
+            TreeNode::Directory { .. } => panic!("expected File node"),
+        }
+    }
+
+    // ============== Scenario 4: add_remote_file has Remote content ==============
+
+    #[test]
+    fn s04_add_remote_file() {
+        let mut tree = Tree::new();
+        let ino = tree.add_remote_file(
+            1,
+            "abc.png",
+            "https://cdn.example.com/blob".to_string(),
+            SHA_A.to_string(),
+            100,
+            Some("image/png".to_string()),
+        );
+        assert_eq!(tree.lookup(1, "abc.png"), Some(ino));
+        match tree.get(ino).unwrap() {
+            TreeNode::File { size, content, .. } => {
+                assert_eq!(*size, 100);
+                match content {
+                    FileContent::Remote {
+                        url,
+                        sha256,
+                        mime_type,
+                    } => {
+                        assert_eq!(url, "https://cdn.example.com/blob");
+                        assert_eq!(sha256, SHA_A);
+                        assert_eq!(mime_type.as_deref(), Some("image/png"));
+                    }
+                    FileContent::Static(_) => panic!("expected Remote content"),
+                }
+            }
+            TreeNode::Directory { .. } => panic!("expected File node"),
+        }
+    }
+
+    // ============== Scenario 5: build_from_descriptors → by-sha256 has 3 files ==============
+
+    #[test]
+    fn s05_build_by_sha256_has_all_files() {
+        let mut tree = Tree::new();
+        let descs = vec![
+            mk_desc(SHA_A, Some("image/png"), 1700000000),
+            mk_desc(SHA_B, Some("image/png"), 1700000000),
+            mk_desc(SHA_C, Some("image/png"), 1700000000),
+        ];
+        tree.build_from_descriptors(1, &descs);
+
+        let by_sha = tree
+            .lookup(1, "by-sha256")
+            .expect("by-sha256 dir should exist");
+        let entries = tree.readdir(by_sha).expect("should list by-sha256");
+        assert_eq!(entries.len(), 3, "by-sha256 should have exactly 3 files");
+
+        let names: Vec<&str> = entries.iter().map(|(_, n, _)| n.as_str()).collect();
+        for sha in [SHA_A, SHA_B, SHA_C] {
+            assert!(
+                names.iter().any(|n| n.starts_with(sha)),
+                "by-sha256 should contain entry starting with {}",
+                sha
+            );
+        }
+    }
+
+    // ============== Scenario 6: build_from_descriptors → by-type has correct MIME dirs ==============
+
+    #[test]
+    fn s06_build_by_type_mime_dirs() {
+        let mut tree = Tree::new();
+        let descs = vec![
+            mk_desc(SHA_A, Some("image/png"), 1700000000),
+            mk_desc(SHA_B, Some("application/pdf"), 1700000000),
+        ];
+        tree.build_from_descriptors(1, &descs);
+
+        let by_type = tree.lookup(1, "by-type").expect("by-type dir should exist");
+        let entries = tree.readdir(by_type).expect("should list by-type");
+        let names: Vec<&str> = entries.iter().map(|(_, n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"image_png"),
+            "should have image_png dir, got {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"application_pdf"),
+            "should have application_pdf dir, got {:?}",
+            names
+        );
+    }
+
+    // ============== Scenario 7: build_from_descriptors → by-date has YYYY/MM/DD ==============
+
+    #[test]
+    fn s07_build_by_date_structure() {
+        let mut tree = Tree::new();
+        // timestamp 1700000000 = 2023-11-14
+        let descs = vec![mk_desc(SHA_A, Some("image/png"), 1700000000)];
+        tree.build_from_descriptors(1, &descs);
+
+        let by_date = tree.lookup(1, "by-date").expect("by-date dir should exist");
+        let year = tree.lookup(by_date, "2023").expect("2023 dir should exist");
+        let month = tree
+            .lookup(year, "11")
+            .expect("11 (November) dir should exist");
+        let day = tree.lookup(month, "14").expect("14th day dir should exist");
+        let entries = tree.readdir(day).expect("should list day dir");
+        assert_eq!(entries.len(), 1, "day dir should have exactly 1 file");
+        assert!(
+            entries[0].1.starts_with(SHA_A),
+            "file should start with sha, got {}",
+            entries[0].1
+        );
+    }
+
+    // ============== Scenario 8: empty descriptors → dirs created but empty ==============
+
+    #[test]
+    fn s08_build_empty_descriptors() {
+        let mut tree = Tree::new();
+        tree.build_from_descriptors(1, &[]);
+
+        for dir_name in &["by-sha256", "by-type", "by-date"] {
+            let ino = tree
+                .lookup(1, dir_name)
+                .unwrap_or_else(|| panic!("{} should exist", dir_name));
+            let entries = tree.readdir(ino).expect("should be a directory");
+            assert!(entries.is_empty(), "{} should be empty", dir_name);
+        }
+    }
+
+    // ============== Scenario 9: duplicate sha256 → by-sha256 has 1 entry ==============
+
+    #[test]
+    fn s09_build_duplicate_sha256_dedup() {
+        let mut tree = Tree::new();
+        let descs = vec![
+            mk_desc(SHA_A, Some("image/png"), 1700000000),
+            mk_desc(SHA_A, Some("image/png"), 1700001000),
+        ];
+        tree.build_from_descriptors(1, &descs);
+
+        let by_sha = tree.lookup(1, "by-sha256").unwrap();
+        let entries = tree.readdir(by_sha).unwrap();
+        assert_eq!(entries.len(), 1, "by-sha256 should deduplicate to 1 entry");
+    }
+
+    // ============== Scenario 10: invalid sha256 → skipped ==============
+
+    #[test]
+    fn s10_build_invalid_sha256_skipped() {
+        let mut tree = Tree::new();
+        let descs = vec![
+            mk_desc("not-a-valid-hash", Some("image/png"), 1700000000),
+            mk_desc(SHA_A, Some("image/png"), 1700000000),
+        ];
+        tree.build_from_descriptors(1, &descs);
+
+        let by_sha = tree.lookup(1, "by-sha256").unwrap();
+        let entries = tree.readdir(by_sha).unwrap();
+        assert_eq!(entries.len(), 1, "only valid sha256 should be present");
+        assert!(entries[0].1.starts_with(SHA_A));
+    }
+
+    // ============== Scenario 11: None mime_type → grouped under application_octet-stream ==============
+
+    #[test]
+    fn s11_build_none_mime_type_grouped() {
+        let mut tree = Tree::new();
+        let descs = vec![mk_desc(SHA_A, None, 1700000000)];
+        tree.build_from_descriptors(1, &descs);
+
+        let by_type = tree.lookup(1, "by-type").unwrap();
+        let entries = tree.readdir(by_type).unwrap();
+        let names: Vec<&str> = entries.iter().map(|(_, n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"application_octet-stream"),
+            "None mime should be grouped under application_octet-stream, got {:?}",
+            names
+        );
+    }
+
+    // ============== Scenario 12: readdir on File returns None ==============
+
+    #[test]
+    fn s12_readdir_on_file_returns_none() {
+        let mut tree = Tree::new();
+        let ino = tree.add_static_file(1, "file.txt", b"data".to_vec());
+        assert_eq!(
+            tree.readdir(ino),
+            None,
+            "readdir on a file should return None"
+        );
+    }
+
+    // ============== Scenario 13: lookup on File returns None ==============
+
+    #[test]
+    fn s13_lookup_on_file_returns_none() {
+        let mut tree = Tree::new();
+        let ino = tree.add_static_file(1, "file.txt", b"data".to_vec());
+        assert_eq!(
+            tree.lookup(ino, "anything"),
+            None,
+            "lookup on a file should return None"
+        );
+    }
+
+    // ============== Scenario 14: size() returns correct values ==============
+
+    #[test]
+    fn s14_size_correct() {
+        let mut tree = Tree::new();
+        let dir_ino = tree.add_directory(1, "dir");
+        let file_ino = tree.add_static_file(1, "file.txt", b"four bytes".to_vec());
+
+        assert_eq!(tree.size(1), Some(0), "root directory size should be 0");
+        assert_eq!(tree.size(dir_ino), Some(0), "directory size should be 0");
+        assert_eq!(tree.size(file_ino), Some(10), "file size should be 10");
+        assert_eq!(tree.size(999), None, "nonexistent inode should return None");
+    }
+
+    // ============== Scenario 15: kind() returns correct NodeKind ==============
+
+    #[test]
+    fn s15_kind_correct() {
+        let mut tree = Tree::new();
+        let dir_ino = tree.add_directory(1, "dir");
+        let file_ino = tree.add_static_file(1, "file.txt", b"x".to_vec());
+
+        assert_eq!(tree.kind(1), Some(NodeKind::Directory));
+        assert_eq!(tree.kind(dir_ino), Some(NodeKind::Directory));
+        assert_eq!(tree.kind(file_ino), Some(NodeKind::File));
+        assert_eq!(tree.kind(999), None);
+    }
+}
