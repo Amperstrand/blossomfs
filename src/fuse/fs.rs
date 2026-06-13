@@ -925,7 +925,7 @@ mod tests {
         let content = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
         let hash = sha256_hex(content);
 
-        let mock_server_uri = rt.block_on(async {
+        let (mock_server_uri, _server) = rt.block_on(async {
             use wiremock::matchers::{method, path};
             use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -935,7 +935,7 @@ mod tests {
                 .respond_with(ResponseTemplate::new(200).set_body_bytes(content.to_vec()))
                 .mount(&server)
                 .await;
-            server.uri()
+            (server.uri(), server)
         });
 
         let url = format!("{}/blob20", mock_server_uri);
