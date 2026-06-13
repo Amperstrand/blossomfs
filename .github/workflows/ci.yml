@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev pkg-config build-essential
+
+      - name: Load FUSE kernel module
+        run: sudo modprobe fuse || true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Unit tests
+        run: cargo test
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Install nak (Nostr Army Knife)
+        run: |
+          go install github.com/fiatjaf/nak@latest
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+
+      - name: Install Cashu CLI
+        run: pip install cashu
+
+      - name: Fund CI Cashu wallet
+        run: |
+          cashu -h https://testnut.cashu.space -w ci-test -u sat -y invoice 1000 || true
+
+      - name: Run integration test (Blossom server + Cashu payment + FUSE mount)
+        env:
+          BLOSSOMFS_BIN: ./target/release/blossomfs
+        run: bash scripts/ci_test.sh
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-test-output
+          path: /tmp/blossom-ci/
+          retention-days: 7
