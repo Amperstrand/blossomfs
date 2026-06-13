@@ -29,7 +29,7 @@ nak_auth() {
     -t "t=upload" \
     -t "expiration=$(($(date +%s) + 600))" \
     -t "x=$blob_hash" \
-    --sec "$SECRET" 2>/dev/null
+    --sec "$SECRET" < /dev/null 2>/dev/null
 }
 
 cashu_send() {
@@ -100,7 +100,7 @@ info "Large file: ${LARGE_SIZE}B sha256=${LARGE_HASH:0:16}... prefix=$(head -c20
 echo ""
 echo "━━━ Scenario 1: Upload <1MB without payment ━━━"
 
-SMALL_RESULT=$(nak blossom -s "$SERVER" --sec "$SECRET" upload "${WORKDIR}/small.bin" 2>&1 || true)
+SMALL_RESULT=$(nak blossom -s "$SERVER" --sec "$SECRET" upload "${WORKDIR}/small.bin" < /dev/null 2>&1 || true)
 if echo "$SMALL_RESULT" | grep -q "$SMALL_HASH"; then
   pass "Small file uploaded successfully"
   echo "$SMALL_RESULT" | jq '.' 2>/dev/null || echo "$SMALL_RESULT"
