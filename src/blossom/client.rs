@@ -100,12 +100,10 @@ impl BlossomClient {
         let body = response.text().await?;
         let descriptors: Vec<BlobDescriptor> = serde_json::from_str(&body)?;
 
-        // Determine next cursor: if we filled the page (results >= limit),
-        // use the last descriptor's uploaded timestamp as the cursor.
+        // Determine next cursor per BUD-12: if we filled the page (results >= limit),
+        // use the last descriptor's sha256 as the cursor.
         let next_cursor = match (descriptors.last(), limit) {
-            (Some(last), Some(l)) if (descriptors.len() as u32) >= l => {
-                Some(last.uploaded.to_string())
-            }
+            (Some(last), Some(l)) if (descriptors.len() as u32) >= l => Some(last.sha256.clone()),
             _ => None,
         };
 
@@ -302,12 +300,12 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        // Mock B (highest priority=1): matches GET /list/pagepk with cursor=2000
-        // (the uploaded timestamp of the last item in page 1).
+        // Mock B (highest priority=1): matches GET /list/pagepk with cursor=p1b
+        // (the sha256 of the last item in page 1, per BUD-12 spec).
         // Returns 1 item — the second (final) page.
         Mock::given(method("GET"))
             .and(path("/list/pagepk"))
-            .and(query_param("cursor", "2000"))
+            .and(query_param("cursor", "p1b"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(serde_json::json!([desc_json("p2a", 3000)])),
