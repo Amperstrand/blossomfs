@@ -10,6 +10,17 @@
 //! - `uploaded`: Unix timestamp of upload
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+pub const MAX_BLOB_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+
+#[derive(Error, Debug)]
+pub enum DescriptorError {
+    #[error("invalid URL scheme: must be http or https, got {0}")]
+    InvalidUrlScheme(String),
+    #[error("blob size {size} exceeds max {MAX_BLOB_SIZE}")]
+    SizeTooLarge { size: u64 },
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
@@ -33,6 +44,16 @@ impl BlobDescriptor {
     #[allow(dead_code)]
     pub fn sha256_lower(&self) -> String {
         self.sha256.to_lowercase()
+    }
+
+    pub fn validate(&self) -> Result<(), DescriptorError> {
+        if !self.url.starts_with("http://") && !self.url.starts_with("https://") {
+            return Err(DescriptorError::InvalidUrlScheme(self.url.clone()));
+        }
+        if self.size > MAX_BLOB_SIZE {
+            return Err(DescriptorError::SizeTooLarge { size: self.size });
+        }
+        Ok(())
     }
 }
 
@@ -218,5 +239,86 @@ mod tests {
         };
 
         assert_eq!(desc.sha256_lower(), "abc123def456");
+    }
+
+    #[test]
+    fn test_validate_http_url_passes() {
+        let desc = BlobDescriptor {
+            url: "http://example.com/blob".to_string(),
+            sha256: "abc123".to_string(),
+            size: 100,
+            mime_type: None,
+            uploaded: 1,
+        };
+        assert!(desc.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_https_url_passes() {
+        let desc = BlobDescriptor {
+            url: "https://example.com/blob".to_string(),
+            sha256: "abc123".to_string(),
+            size: 100,
+            mime_type: None,
+            uploaded: 1,
+        };
+        assert!(desc.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_ftp_url_rejected() {
+        let desc = BlobDescriptor {
+            url: "ftp://evil.com/blob".to_string(),
+            sha256: "abc123".to_string(),
+            size: 100,
+            mime_type: None,
+            uploaded: 1,
+        };
+        assert!(matches!(
+            desc.validate(),
+            Err(DescriptorError::InvalidUrlScheme(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_file_url_rejected() {
+        let desc = BlobDescriptor {
+            url: "file:///etc/passwd".to_string(),
+            sha256: "abc123".to_string(),
+            size: 100,
+            mime_type: None,
+            uploaded: 1,
+        };
+        assert!(matches!(
+            desc.validate(),
+            Err(DescriptorError::InvalidUrlScheme(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_size_at_limit_passes() {
+        let desc = BlobDescriptor {
+            url: "https://x/y".to_string(),
+            sha256: "abc123".to_string(),
+            size: MAX_BLOB_SIZE,
+            mime_type: None,
+            uploaded: 1,
+        };
+        assert!(desc.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_size_over_limit_rejected() {
+        let desc = BlobDescriptor {
+            url: "https://x/y".to_string(),
+            sha256: "abc123".to_string(),
+            size: MAX_BLOB_SIZE + 1,
+            mime_type: None,
+            uploaded: 1,
+        };
+        assert!(matches!(
+            desc.validate(),
+            Err(DescriptorError::SizeTooLarge { .. })
+        ));
     }
 }

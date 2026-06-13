@@ -38,9 +38,9 @@ pub async fn discover_servers(
     client.disconnect().await;
 
     let raw_tags: Vec<(&str, Option<&str>)> = events
-        .first()
-        .map(|event| event.tags.iter().map(|t| (t.kind(), t.content())).collect())
-        .unwrap_or_default();
+        .iter()
+        .flat_map(|event| event.tags.iter().map(|t| (t.kind(), t.content())))
+        .collect();
 
     let servers = extract_server_urls(&raw_tags);
 

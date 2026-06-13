@@ -13,11 +13,11 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::blossom::descriptor::MAX_BLOB_SIZE;
 use crate::cache::object_cache::{
     CacheError, cache_exists, cache_path, ensure_cache_dir, read_cached, temp_path,
 };
 
-/// Errors that can occur during fetch-and-cache operations.
 #[derive(Error, Debug)]
 pub enum FetchError {
     #[error("HTTP error: {0}")]
@@ -28,6 +28,8 @@ pub enum FetchError {
     Cache(#[from] CacheError),
     #[error("sha256 mismatch: expected {expected}, got {actual}")]
     HashMismatch { expected: String, actual: String },
+    #[error("response too large: {size} bytes (max {MAX_BLOB_SIZE})")]
+    ResponseTooLarge { size: u64 },
 }
 
 /// Download a blob from `url`, verify its SHA-256, and cache it.
@@ -58,9 +60,27 @@ pub async fn fetch_and_cache(
     }
 
     // 2a. Download — error_for_status converts 4xx/5xx into Err
-    let client = reqwest::Client::new();
+    //     Redirect policy: none (security — never follow redirects from blob servers)
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
     let resp = client.get(url).send().await?.error_for_status()?;
+
+    // Size guard: reject responses larger than MAX_BLOB_SIZE to prevent OOM
+    if let Some(len) = resp.content_length()
+        && len > MAX_BLOB_SIZE
+    {
+        return Err(FetchError::ResponseTooLarge { size: len });
+    }
+
     let bytes = resp.bytes().await?;
+
+    // Double-check actual byte count (Content-Length can be absent or lie)
+    if bytes.len() as u64 > MAX_BLOB_SIZE {
+        return Err(FetchError::ResponseTooLarge {
+            size: bytes.len() as u64,
+        });
+    }
 
     // 2b. Compute SHA-256
     let mut hasher = Sha256::new();

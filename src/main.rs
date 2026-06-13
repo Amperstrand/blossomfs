@@ -267,10 +267,14 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
                 let meta_root = tree.add_directory(tree.root(), "metadata");
                 for meta in &metas {
                     if let Some(ref sha) = meta.sha256 {
-                        let json = serde_json::to_string_pretty(meta)
-                            .unwrap_or_default()
-                            .into_bytes();
-                        tree.add_static_file(meta_root, &format!("{}.json", sha), json);
+                        if sha.len() == 64 && sha.chars().all(|c| c.is_ascii_hexdigit()) {
+                            let json = serde_json::to_string_pretty(meta)
+                                .unwrap_or_default()
+                                .into_bytes();
+                            tree.add_static_file(meta_root, &format!("{}.json", sha), json);
+                        } else {
+                            tracing::warn!("skipping NIP-94 metadata with invalid sha256: {}", sha);
+                        }
                     }
                 }
             }
