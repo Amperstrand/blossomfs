@@ -11,8 +11,10 @@
 
 use std::ffi::OsStr;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+
+use crate::cache::fetch::fetch_and_cache;
 
 use fuser::{
     BsdFileFlags, CopyFileRangeFlags, Errno, FileAttr, FileHandle, FileType, Filesystem,
@@ -36,12 +38,36 @@ const TTL: Duration = Duration::from_secs(1);
 /// return `EROFS`.
 pub struct BlossomFS {
     tree: Tree,
+    cache_base: Option<PathBuf>,
+    runtime_handle: Option<tokio::runtime::Handle>,
 }
 
 impl BlossomFS {
     /// Create a new filesystem wrapper around the given tree.
     pub fn new(tree: Tree) -> Self {
-        Self { tree }
+        Self {
+            tree,
+            cache_base: None,
+            runtime_handle: None,
+        }
+    }
+
+    /// Create a filesystem with lazy-fetch cache support.
+    ///
+    /// When `cache_base` and `runtime_handle` are both set, reading a
+    /// `FileContent::Remote` file triggers a lazy fetch via
+    /// [`fetch_and_cache`], verifies SHA-256, caches to disk, and returns
+    /// the bytes. Subsequent reads of the same blob serve from cache.
+    pub fn new_with_cache(
+        tree: Tree,
+        cache_base: PathBuf,
+        runtime_handle: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            tree,
+            cache_base: Some(cache_base),
+            runtime_handle: Some(runtime_handle),
+        }
     }
 
     // ======================== Internal testable helpers ========================
@@ -110,7 +136,8 @@ impl BlossomFS {
     /// Read bytes from a file at the given offset.
     ///
     /// - Static files: returns the requested byte slice (clamped to EOF).
-    /// - Remote files: returns [`ReadError::Remote`] (not supported in M1/M2).
+    /// - Remote files: fetched and cached if cache_base + runtime_handle are set;
+    ///   otherwise returns [`ReadError::Remote`].
     /// - Directories: returns [`ReadError::IsDir`].
     /// - Missing inode: returns [`ReadError::NotFound`].
     fn read_content(&self, ino: u64, offset: usize, size: usize) -> Result<Vec<u8>, ReadError> {
@@ -126,7 +153,27 @@ impl BlossomFS {
                         Ok(data[offset..end].to_vec())
                     }
                 }
-                FileContent::Remote { .. } => Err(ReadError::Remote),
+                FileContent::Remote { url, sha256, .. } => {
+                    let (cache_base, handle) = match (&self.cache_base, &self.runtime_handle) {
+                        (Some(cb), Some(h)) => (cb, h),
+                        _ => return Err(ReadError::Remote),
+                    };
+
+                    tracing::debug!("fetching blob {} from {}", sha256, url);
+                    let full_data = handle
+                        .block_on(fetch_and_cache(url, sha256, cache_base))
+                        .map_err(|e| {
+                            tracing::error!("fetch failed for {}: {}", sha256, e);
+                            ReadError::Fetch
+                        })?;
+
+                    if offset >= full_data.len() {
+                        Ok(Vec::new())
+                    } else {
+                        let end = (offset + size).min(full_data.len());
+                        Ok(full_data[offset..end].to_vec())
+                    }
+                }
             },
         }
     }
@@ -177,8 +224,10 @@ enum ReadError {
     NotFound,
     /// Inode is a directory.
     IsDir,
-    /// Content is remote (fetching not supported in M1/M2).
+    /// Content is remote and no cache/runtime is configured.
     Remote,
+    /// Fetch-and-cache operation failed (network, hash mismatch, IO).
+    Fetch,
 }
 
 /// Map a [`ReadError`] to the corresponding FUSE errno.
@@ -188,6 +237,7 @@ impl ReadError {
             ReadError::NotFound => Errno::ENOENT,
             ReadError::IsDir => Errno::EISDIR,
             ReadError::Remote => Errno::EIO,
+            ReadError::Fetch => Errno::EIO,
         }
     }
 }
@@ -703,10 +753,12 @@ mod tests {
         assert_eq!(count, 4);
     }
 
-    // ============== S14: read on remote file returns Remote error ==============
+    // ============== S14: read on remote file returns Remote error (no cache configured) ==============
 
     #[test]
     fn s14_read_remote_file() {
+        // make_test_fs() uses BlossomFS::new(tree) — no cache/runtime configured,
+        // so Remote reads return ReadError::Remote.
         let fs = make_test_fs();
         let result = fs.read_content(4, 0, 100);
         assert_eq!(result, Err(ReadError::Remote));
@@ -745,5 +797,203 @@ mod tests {
         assert_eq!(format!("{:?}", ReadError::NotFound.to_errno()), "Errno(2)"); // ENOENT
         assert_eq!(format!("{:?}", ReadError::IsDir.to_errno()), "Errno(21)"); // EISDIR
         assert_eq!(format!("{:?}", ReadError::Remote.to_errno()), "Errno(5)"); // EIO
+        assert_eq!(format!("{:?}", ReadError::Fetch.to_errno()), "Errno(5)"); // EIO
+    }
+
+    // ============== Lazy fetch tests (S18-S22) ==============
+
+    use sha2::{Digest, Sha256};
+
+    fn sha256_hex(content: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(content);
+        hex::encode(hasher.finalize())
+    }
+
+    /// Build a tree with a single Remote file pointing at `url` with the given content hash.
+    fn make_cache_test_tree(url: String, sha256: String, size: u64) -> Tree {
+        let mut tree = Tree::new();
+        tree.add_remote_file(
+            tree.root(),
+            "remote.bin",
+            url,
+            sha256,
+            size,
+            Some("application/octet-stream".to_string()),
+        );
+        tree
+    }
+
+    /// Build a BlossomFS with cache support for lazy-fetch tests.
+    fn make_cache_fs(tree: Tree, cache_base: PathBuf, handle: tokio::runtime::Handle) -> BlossomFS {
+        BlossomFS::new_with_cache(tree, cache_base, handle)
+    }
+
+    // ============== S18: Remote file with cache — fetch and return content ==============
+
+    #[test]
+    fn s18_remote_fetch_returns_content() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+
+        let content = b"Hello from BlossomFS lazy fetch!";
+        let hash = sha256_hex(content);
+
+        let mock_server_uri = rt.block_on(async {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/blob"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(content.to_vec()))
+                .mount(&server)
+                .await;
+            server.uri()
+        });
+
+        let url = format!("{}/blob", mock_server_uri);
+        let tree = make_cache_test_tree(url, hash.clone(), content.len() as u64);
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let fs = make_cache_fs(tree, cache_dir.path().to_path_buf(), handle);
+
+        // remote.bin is inode 2 (root=1, file=2)
+        let data = fs.read_content(2, 0, 1024).expect("should fetch and read");
+        assert_eq!(data, content.to_vec());
+    }
+
+    // ============== S19: Second read serves from cache (no HTTP) ==============
+
+    #[test]
+    fn s19_second_read_serves_from_cache() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+
+        let content = b"cached blob data for s19";
+        let hash = sha256_hex(content);
+
+        let (mock_server_uri, mock_server_handle) = rt.block_on(async {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/blob19"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(content.to_vec()))
+                .expect(1) // Only first call hits the server
+                .mount(&server)
+                .await;
+            (server.uri(), server)
+        });
+
+        let url = format!("{}/blob19", mock_server_uri);
+        let tree = make_cache_test_tree(url, hash.clone(), content.len() as u64);
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let fs = make_cache_fs(tree, cache_dir.path().to_path_buf(), handle);
+
+        // First read: fetches from HTTP
+        let data1 = fs
+            .read_content(2, 0, 1024)
+            .expect("first read should succeed");
+        assert_eq!(data1, content.to_vec());
+
+        // Second read: served from cache (mock expects exactly 1 request)
+        let data2 = fs
+            .read_content(2, 0, 1024)
+            .expect("second read should succeed");
+        assert_eq!(data2, content.to_vec());
+
+        // Verify cache file exists on disk
+        assert!(
+            crate::cache::object_cache::cache_exists(cache_dir.path(), &hash),
+            "cache file should exist on disk"
+        );
+
+        // Drop the mock server handle to verify expectations were met
+        drop(mock_server_handle);
+    }
+
+    // ============== S20: Read Remote file with offset ==============
+
+    #[test]
+    fn s20_remote_read_with_offset() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+
+        let content = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let hash = sha256_hex(content);
+
+        let mock_server_uri = rt.block_on(async {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/blob20"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(content.to_vec()))
+                .mount(&server)
+                .await;
+            server.uri()
+        });
+
+        let url = format!("{}/blob20", mock_server_uri);
+        let tree = make_cache_test_tree(url, hash, content.len() as u64);
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let fs = make_cache_fs(tree, cache_dir.path().to_path_buf(), handle);
+
+        // Read from offset 10, size 10 → should return "ABCDEFGHIJ"
+        let data = fs
+            .read_content(2, 10, 10)
+            .expect("offset read should succeed");
+        assert_eq!(data, b"ABCDEFGHIJ");
+    }
+
+    // ============== S21: Fetch failure (404) returns Fetch error ==============
+
+    #[test]
+    fn s21_fetch_failure_404_returns_fetch_error() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+
+        let hash = sha256_hex(b"some content that won't be fetched");
+
+        let mock_server_uri = rt.block_on(async {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/notfound"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+            server.uri()
+        });
+
+        let url = format!("{}/notfound", mock_server_uri);
+        let tree = make_cache_test_tree(url, hash, 100);
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let fs = make_cache_fs(tree, cache_dir.path().to_path_buf(), handle);
+
+        let result = fs.read_content(2, 0, 100);
+        assert_eq!(result, Err(ReadError::Fetch));
+        // to_errno() maps Fetch → EIO (5)
+        assert_eq!(format!("{:?}", ReadError::Fetch.to_errno()), "Errno(5)");
+    }
+
+    // ============== S22: Remote without cache returns Remote error (backward compat) ==============
+
+    #[test]
+    fn s22_remote_without_cache_returns_remote_error() {
+        // BlossomFS::new(tree) — no cache configured
+        let fs = make_test_fs();
+        // make_test_fs has remote.bin at inode 4
+        let result = fs.read_content(4, 0, 100);
+        assert_eq!(result, Err(ReadError::Remote));
+        assert_eq!(format!("{:?}", ReadError::Remote.to_errno()), "Errno(5)");
     }
 }

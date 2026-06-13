@@ -17,6 +17,7 @@ use std::path::Path;
 use clap::Parser;
 use fuser::MountOption;
 
+use crate::blossom::client::BlossomClient;
 use crate::blossom::manifest::load_manifest;
 use crate::cli::{Cli, Command};
 use crate::fuse::fs::BlossomFS;
@@ -52,27 +53,59 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("mountpoint {:?} does not exist", args.mountpoint).into());
     }
 
+    let rt = tokio::runtime::Runtime::new()?;
+
     // Build the virtual tree
     let mut tree = Tree::new();
-
-    // Determine blob count and server info for virtual files
     let mut blob_count = 0usize;
-    let server_count = args.server.len();
+
+    // Create blobs directory if we have manifest or servers
+    let need_blobs = args.manifest.is_some() || !args.server.is_empty();
+    let blobs_dir = if need_blobs {
+        Some(tree.add_directory(tree.root(), "blobs"))
+    } else {
+        None
+    };
 
     // Load manifest if provided
     if let Some(ref manifest_path) = args.manifest {
         let descriptors = load_manifest(manifest_path)?;
-        blob_count = descriptors.len();
-        tracing::info!("loaded {} descriptors from manifest", blob_count);
+        blob_count += descriptors.len();
+        tracing::info!("loaded {} descriptors from manifest", descriptors.len());
+        if let Some(bd) = blobs_dir {
+            tree.build_from_descriptors(bd, &descriptors);
+        }
+    }
 
-        // Create directory structure for blobs
-        // M1 layout: /blobs/ with by-sha256/by-type/by-date
-        let blobs_dir = tree.add_directory(tree.root(), "blobs");
-        tree.build_from_descriptors(blobs_dir, &descriptors);
+    // List blobs from Blossom servers (BUD-12)
+    if !args.server.is_empty() {
+        let pubkey_hex = args.pubkey.as_deref().unwrap_or("all");
+
+        for server_url in &args.server {
+            let client = BlossomClient::new(server_url);
+            tracing::info!(
+                "listing blobs from {} for pubkey={}",
+                server_url,
+                pubkey_hex
+            );
+            match rt.block_on(client.list_all_blobs(pubkey_hex)) {
+                Ok(descriptors) => {
+                    tracing::info!("listed {} blobs from {}", descriptors.len(), server_url);
+                    blob_count += descriptors.len();
+                    if let Some(bd) = blobs_dir {
+                        tree.build_from_descriptors(bd, &descriptors);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("failed to list blobs from {}: {}", server_url, e);
+                }
+            }
+        }
     }
 
     // Add virtual files
     let npub_display = args.npub.as_deref().unwrap_or("all");
+    let server_count = args.server.len();
     let mount_info = MountInfo {
         mountpoint: args.mountpoint.display().to_string(),
         npub: npub_display.to_string(),
@@ -92,8 +125,12 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.mountpoint
     );
 
-    // Create filesystem
-    let fs = BlossomFS::new(tree);
+    // Ensure cache directory exists
+    std::fs::create_dir_all(&args.cache_dir)?;
+
+    // Create filesystem with cache and tokio runtime handle for lazy fetch
+    let handle = rt.handle().clone();
+    let fs = BlossomFS::new_with_cache(tree, args.cache_dir.clone(), handle);
 
     // Mount options
     let mut options = fuser::Config::default();
@@ -105,6 +142,9 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("mounting FUSE filesystem...");
     fuser::mount2(fs, &args.mountpoint, &options)?;
+
+    // rt stays alive until here — dropped after mount2 returns (after unmount)
+    drop(rt);
 
     Ok(())
 }
