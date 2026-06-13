@@ -64,16 +64,28 @@ mkdir -p "$WORKDIR" "$MOUNTPOINT"
 ensure_cashu_balance
 
 # ─── Test files ─────────────────────────────────────────────────────────────
-# Small file: 512 KB of random data (<1MB → no payment)
-dd if=/dev/urandom of="${WORKDIR}/small.bin" bs=1024 count=512 status=none
+# Git commit hash prefix + zero padding (identifiable, reproducible per commit)
+GIT_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+info "Git commit: $GIT_SHA"
+
+# Small file: 512 KB (<1MB → free). First bytes = "blossomfs-ci:<commit>", rest zeros.
+{
+  printf 'blossomfs-ci:%s\0' "$GIT_SHA"
+  dd if=/dev/zero bs=1 count=$(( 524288 - 40 )) status=none
+} > "${WORKDIR}/small.bin"
+SMALL_SIZE=$(stat -c%s "${WORKDIR}/small.bin")
 SMALL_HASH=$(sha256sum "${WORKDIR}/small.bin" | cut -d' ' -f1)
 
-# Large file: 2 MB of zeros (>1MB → payment required)
-dd if=/dev/zero of="${WORKDIR}/large.bin" bs=1048576 count=2 status=none
+# Large file: 2 MB (>1MB → payment). First bytes = "blossomfs-ci:<commit>", rest zeros.
+{
+  printf 'blossomfs-ci:%s\0' "$GIT_SHA"
+  dd if=/dev/zero bs=1048576 count=2 status=none
+} > "${WORKDIR}/large.bin"
+LARGE_SIZE=$(stat -c%s "${WORKDIR}/large.bin")
 LARGE_HASH=$(sha256sum "${WORKDIR}/large.bin" | cut -d' ' -f1)
 
-info "Small file: 512KB sha256=${SMALL_HASH:0:16}..."
-info "Large file: 2MB   sha256=${LARGE_HASH:0:16}..."
+info "Small file: ${SMALL_SIZE}B sha256=${SMALL_HASH:0:16}... prefix=$(head -c20 "${WORKDIR}/small.bin" | tr '\0' '~')"
+info "Large file: ${LARGE_SIZE}B sha256=${LARGE_HASH:0:16}... prefix=$(head -c20 "${WORKDIR}/large.bin" | tr '\0' '~')"
 
 # ─── Scenario 1: Upload <1MB (no payment needed) ────────────────────────────
 echo ""
@@ -96,7 +108,7 @@ AUTH_B64=$(echo "$AUTH_EVENT" | base64 -w0)
 HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT "${SERVER}/upload" \
   -H "Authorization: Nostr $AUTH_B64" \
   -H "Content-Type: application/octet-stream" \
-  -H "Content-Length: 2097152" \
+  -H "Content-Length: $LARGE_SIZE" \
   -H "X-SHA-256: $LARGE_HASH" \
   --data-binary "@${WORKDIR}/large.bin")
 
@@ -122,7 +134,7 @@ AUTH_B64=$(echo "$AUTH_EVENT" | base64 -w0)
 UPLOAD_RESP=$(curl -s -w "\n%{http_code}" -X PUT "${SERVER}/upload" \
   -H "Authorization: Nostr $AUTH_B64" \
   -H "Content-Type: application/octet-stream" \
-  -H "Content-Length: 2097152" \
+  -H "Content-Length: $LARGE_SIZE" \
   -H "X-SHA-256: $LARGE_HASH" \
   -H "X-Cashu: $PAYMENT_TOKEN" \
   --data-binary "@${WORKDIR}/large.bin")
