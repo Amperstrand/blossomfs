@@ -12,7 +12,7 @@ env:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@v4
@@ -50,12 +50,18 @@ jobs:
           go install github.com/fiatjaf/nak@latest
           echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
+      - name: Cache Cashu wallet
+        uses: actions/cache@v4
+        with:
+          path: ~/.cashu/
+          key: cashu-wallet-v1
+
       - name: Install Cashu CLI
         run: pip install cashu "marshmallow<4"
 
       - name: Fund CI Cashu wallet
         run: |
-          cashu -h https://testnut.cashu.space -w ci-test -u sat -y invoice 1000 || true
+          timeout 120 cashu -h https://testnut.cashu.space -w ci-test -u sat -y invoice 1000 || true
 
       - name: Run integration test (Blossom server + Cashu payment + FUSE mount)
         env:
