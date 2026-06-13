@@ -1,0 +1,30 @@
+[
+  {
+    "url": "https://cdn.example.com/a9f5c7af6fe6b706d1b7604beb47a62c55968406e27aacbb7fe65e3aa67fcc56.png",
+    "sha256": "a9f5c7af6fe6b706d1b7604beb47a62c55968406e27aacbb7fe65e3aa67fcc56",
+    "size": 512000,
+    "type": "image/png",
+    "uploaded": 1725105921
+  },
+  {
+    "url": "https://cdn.example.com/99896c743d6e5236dc581141ce5f57501b483100af4f60e203df4de1408b5018.mp4",
+    "sha256": "99896c743d6e5236dc581141ce5f57501b483100af4f60e203df4de1408b5018",
+    "size": 5242880,
+    "type": "video/mp4",
+    "uploaded": 1725106832
+  },
+  {
+    "url": "https://cdn.example.com/156920e70a9dc50fe5f6982ad7153e8d09308b59cdcb8857be6356b5b814f798.pdf",
+    "sha256": "156920e70a9dc50fe5f6982ad7153e8d09308b59cdcb8857be6356b5b814f798",
+    "size": 204800,
+    "type": "application/pdf",
+    "uploaded": 1725107743
+  },
+  {
+    "url": "https://cdn.example.com/d217c7dc22c8adf3d4287c0b668a31909dbf607a3c10ded0bb44f99ecb35f02c.txt",
+    "sha256": "d217c7dc22c8adf3d4287c0b668a31909dbf607a3c10ded0bb44f99ecb35f02c",
+    "size": 1024,
+    "type": "text/plain",
+    "uploaded": 1725108654
+  }
+]
