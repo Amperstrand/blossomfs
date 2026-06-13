@@ -8,3 +8,4 @@
 pub mod auth;
 pub mod client;
 pub mod descriptor;
+pub mod manifest;

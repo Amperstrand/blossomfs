@@ -7,3 +7,4 @@
 pub mod fs;
 pub mod inode;
 pub mod tree;
+pub mod vfiles;
