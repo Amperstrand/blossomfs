@@ -51,7 +51,7 @@ jobs:
           echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
       - name: Install Cashu CLI
-        run: pip install cashu
+        run: pip install cashu "marshmallow<4"
 
       - name: Fund CI Cashu wallet
         run: |
