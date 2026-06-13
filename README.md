@@ -32,6 +32,53 @@ Blossom is a media storage layer built on top of Nostr. Blobs are identified by 
 - No BUD-11 authenticated operations (auth tokens)
 - Append-only drive namespace (M7) is designed but not implemented
 
+## Blossom Server Compatibility
+
+BlossomFS relies on two Blossom server endpoints:
+
+| Endpoint | BUD | Required? | Purpose |
+|---|---|---|---|
+| `GET /<sha256>` | BUD-01 | **Yes** | Download blob content by hash |
+| `GET /list/<pubkey>` | BUD-12 | For auto-discovery | Enumerate blobs owned by a pubkey |
+
+### BUD-12 listing: needed but privacy-sensitive
+
+BlossomFS uses BUD-12 listing to discover which blobs exist on a server at mount time. Without it, the filesystem mounts empty and you can only access blobs whose hashes you already know (via a manifest or Nostr events).
+
+However, BUD-12 listing is explicitly marked **unrecommended** in the spec for two reasons:
+
+1. **Privacy.** Anyone who knows a pubkey can enumerate every blob that user has uploaded. There is no access control on the list endpoint in the base spec.
+2. **Resource cost.** A server with thousands of blobs must serialize and serve the full index on every request.
+
+The intended discovery path is via Nostr events: NIP-94 file metadata events (kind 1063) and Blossom server lists (kind 10063) let clients find blobs through relays without querying the server directly. BlossomFS supports this through `--relay` mode (M4), but BUD-12 listing is currently the most reliable way to get a complete view of a single server.
+
+### Known server compatibility
+
+| Server | BUD-01 GET | BUD-12 List | BUD-02 Descriptor | Notes |
+|---|---|---|---|---|
+| **blossom.psbt.me** | Yes | Yes (enabled) | No (404) | Tested with integration suite. Pagination works with sha256 cursor. |
+| **hzrd149/blossom-server** | Yes | Disabled by default | Yes | Set `list.enabled: true` in server config. |
+| **v0l/route96** | Yes | No | Unknown | Lightning payments required for some blobs. |
+
+### Enabling BUD-12 listing on your server
+
+If you run a [hzrd149/blossom-server](https://github.com/hzrd149/blossom-server) instance, listing is disabled by default. Enable it in your server configuration:
+
+```yaml
+list:
+  enabled: true
+```
+
+Be aware of the privacy implications before enabling this on a public server.
+
+### What happens when listing is unavailable
+
+If the server returns 404 or 403 for `/list/<pubkey>`, BlossomFS still mounts successfully. The `STATUS.txt` file in the mount root will indicate that listing failed. You can still:
+
+- Use `--manifest` to provide blob descriptors directly
+- Use `--relay` to discover blobs via Nostr events
+- Access blobs by hash if you construct paths manually
+
 ## Why read-only first?
 
 Read-only is the safe starting point. There is no risk of accidental data loss, no conflict resolution to worry about, and the implementation surface is smaller. The goal is to get the core projection right, the hash-first view of blob storage working correctly, before adding mutation. Once reads are solid and well-tested, writes become a natural extension.
