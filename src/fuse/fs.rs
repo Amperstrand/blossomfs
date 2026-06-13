@@ -423,7 +423,9 @@ impl Filesystem for BlossomFS {
         _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
-        reply.error(Errno::EROFS);
+        // flush is called on close(); for a read-only filesystem this is a no-op.
+        // Returning EROFS here would cause errors on every file close, even reads.
+        reply.ok();
     }
 
     fn fsync(
@@ -434,7 +436,8 @@ impl Filesystem for BlossomFS {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        reply.error(Errno::EROFS);
+        // fsync on a read-only filesystem is a no-op.
+        reply.ok();
     }
 
     fn create(
