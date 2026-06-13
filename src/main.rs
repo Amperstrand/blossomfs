@@ -23,6 +23,7 @@ use crate::cli::{Cli, Command};
 use crate::fuse::fs::BlossomFS;
 use crate::fuse::tree::Tree;
 use crate::fuse::vfiles::{MountInfo, generate_readme, generate_status};
+use crate::util::path::sanitize_hostname;
 
 fn main() {
     // Initialize tracing
@@ -58,47 +59,65 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Build the virtual tree
     let mut tree = Tree::new();
     let mut blob_count = 0usize;
+    let mut all_descriptors: Vec<crate::blossom::descriptor::BlobDescriptor> = Vec::new();
 
-    // Create blobs directory if we have manifest or servers
-    let need_blobs = args.manifest.is_some() || !args.server.is_empty();
-    let blobs_dir = if need_blobs {
-        Some(tree.add_directory(tree.root(), "blobs"))
+    // Create /public/ root if we have any blob sources
+    let need_public = args.manifest.is_some() || !args.server.is_empty();
+    let public_dir = if need_public {
+        Some(tree.add_directory(tree.root(), "public"))
     } else {
         None
     };
 
-    // Load manifest if provided
+    // --- Manifest source: /public/local/servers/manifest/ ---
     if let Some(ref manifest_path) = args.manifest {
         let descriptors = load_manifest(manifest_path)?;
         blob_count += descriptors.len();
         tracing::info!("loaded {} descriptors from manifest", descriptors.len());
-        if let Some(bd) = blobs_dir {
-            tree.build_from_descriptors(bd, &descriptors);
+
+        if let Some(pd) = public_dir {
+            let local_dir = tree.add_directory(pd, "local");
+            let servers_dir = tree.add_directory(local_dir, "servers");
+            let manifest_dir = tree.add_directory(servers_dir, "manifest");
+            tree.build_from_descriptors(manifest_dir, &descriptors);
         }
     }
 
-    // List blobs from Blossom servers (BUD-12)
+    // --- Server sources: /public/<pubkey>/servers/<host>/ and /public/<pubkey>/all-servers/ ---
     if !args.server.is_empty() {
         let pubkey_hex = args.pubkey.as_deref().unwrap_or("all");
 
-        for server_url in &args.server {
-            let client = BlossomClient::new(server_url);
-            tracing::info!(
-                "listing blobs from {} for pubkey={}",
-                server_url,
-                pubkey_hex
-            );
-            match rt.block_on(client.list_all_blobs(pubkey_hex)) {
-                Ok(descriptors) => {
-                    tracing::info!("listed {} blobs from {}", descriptors.len(), server_url);
-                    blob_count += descriptors.len();
-                    if let Some(bd) = blobs_dir {
-                        tree.build_from_descriptors(bd, &descriptors);
+        if let Some(pd) = public_dir {
+            let pubkey_dir = tree.add_directory(pd, pubkey_hex);
+            let servers_dir = tree.add_directory(pubkey_dir, "servers");
+
+            for server_url in &args.server {
+                let host = sanitize_hostname(server_url);
+                let host_dir = tree.add_directory(servers_dir, &host);
+
+                let client = BlossomClient::new(server_url);
+                tracing::info!(
+                    "listing blobs from {} for pubkey={}",
+                    server_url,
+                    pubkey_hex
+                );
+                match rt.block_on(client.list_all_blobs(pubkey_hex)) {
+                    Ok(descriptors) => {
+                        tracing::info!("listed {} blobs from {}", descriptors.len(), server_url);
+                        blob_count += descriptors.len();
+                        all_descriptors.extend(descriptors.clone());
+                        tree.build_from_descriptors(host_dir, &descriptors);
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to list blobs from {}: {}", server_url, e);
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("failed to list blobs from {}: {}", server_url, e);
-                }
+            }
+
+            // All-servers aggregate: only by-sha256, deduplicated
+            if !all_descriptors.is_empty() {
+                let all_dir = tree.add_directory(pubkey_dir, "all-servers");
+                tree.build_by_sha256_only(all_dir, &all_descriptors);
             }
         }
     }

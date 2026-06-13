@@ -39,6 +39,57 @@ The original Blossom Drive design used a single NIP-89 kind 30563 event to repre
 
 This project takes a different approach. BlossomFS uses a hash-first view where each blob is addressed by its SHA-256 hash directly. There is no single drive-defining event to replace or conflict over. An append-only drive design, where namespace metadata accumulates over time rather than being replaced in place, is planned as future work. This avoids the single-event bottleneck and makes incremental updates natural.
 
+## Filesystem Layout
+
+BlossomFS organizes blobs under a `/public/` hierarchy rooted at the mount point. Two virtual files (`README.txt` and `STATUS.txt`) live at the top level. Blob content is projected under `public/` organized by source and server.
+
+### Manifest mode (`--manifest`)
+
+```
+/
+  README.txt
+  STATUS.txt
+  public/
+    local/
+      servers/
+        manifest/
+          by-sha256/
+            <sha256>[.<ext>]
+          by-type/
+            <mime_sanitized>/
+              <sha256>[.<ext>]
+          by-date/
+            YYYY/MM/DD/
+              <sha256>[.<ext>]
+```
+
+### Server mode (`--server`)
+
+Each server's blobs appear under `public/<pubkey>/servers/<hostname>/`. An aggregated, deduplicated view of all servers is under `public/<pubkey>/all-servers/by-sha256/`.
+
+```
+/
+  README.txt
+  STATUS.txt
+  public/
+    <pubkey>/                          ("all" if no pubkey)
+      servers/
+        <hostname>/
+          by-sha256/
+            <sha256>[.<ext>]
+          by-type/
+            <mime_sanitized>/
+              <sha256>[.<ext>]
+          by-date/
+            YYYY/MM/DD/
+              <sha256>[.<ext>]
+      all-servers/
+        by-sha256/                     (deduplicated across all servers)
+          <sha256>[.<ext>]
+```
+
+When both `--manifest` and `--server` are provided, both subtrees coexist under `/public/`.
+
 ## Install dependencies
 
 BlossomFS targets Ubuntu 24.04 with FUSE3. Install the required system packages:

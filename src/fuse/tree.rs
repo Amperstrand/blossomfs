@@ -320,6 +320,41 @@ impl Tree {
             );
         }
     }
+
+    /// Build only the by-sha256 subtree from blob descriptors.
+    ///
+    /// Deduplicates by sha256 — each unique hash appears exactly once.
+    /// Used for the all-servers aggregate view.
+    pub fn build_by_sha256_only(&mut self, parent: u64, descriptors: &[BlobDescriptor]) {
+        let by_sha = self.add_directory(parent, "by-sha256");
+
+        let mut seen: HashSet<String> = HashSet::new();
+
+        for desc in descriptors {
+            let sha = match sanitize_sha256(&desc.sha256) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            if seen.insert(sha.clone()) {
+                let ext = extension_for_descriptor(desc.mime_type.as_deref(), &desc.url);
+                let file_name = if ext.is_empty() {
+                    sha.clone()
+                } else {
+                    format!("{}.{}", sha, ext)
+                };
+
+                self.add_remote_file(
+                    by_sha,
+                    &file_name,
+                    desc.url.clone(),
+                    sha,
+                    desc.size,
+                    desc.mime_type.clone(),
+                );
+            }
+        }
+    }
 }
 
 impl Default for Tree {
@@ -652,5 +687,85 @@ mod tests {
         assert_eq!(tree.kind(dir_ino), Some(NodeKind::Directory));
         assert_eq!(tree.kind(file_ino), Some(NodeKind::File));
         assert_eq!(tree.kind(999), None);
+    }
+
+    // ============== Scenario 16: build_by_sha256_only → only by-sha256 with correct files ==============
+
+    #[test]
+    fn s16_build_by_sha256_only_creates_files() {
+        let mut tree = Tree::new();
+        let parent = tree.add_directory(1, "all-servers");
+        let descs = vec![
+            mk_desc(SHA_A, Some("image/png"), 1700000000),
+            mk_desc(SHA_B, Some("image/png"), 1700000000),
+        ];
+        tree.build_by_sha256_only(parent, &descs);
+
+        // Only by-sha256 should exist, not by-type or by-date
+        let by_sha = tree
+            .lookup(parent, "by-sha256")
+            .expect("by-sha256 dir should exist");
+        assert_eq!(
+            tree.lookup(parent, "by-type"),
+            None,
+            "by-type should NOT exist in build_by_sha256_only"
+        );
+        assert_eq!(
+            tree.lookup(parent, "by-date"),
+            None,
+            "by-date should NOT exist in build_by_sha256_only"
+        );
+
+        let entries = tree.readdir(by_sha).expect("should list by-sha256");
+        assert_eq!(entries.len(), 2, "by-sha256 should have exactly 2 files");
+
+        let names: Vec<&str> = entries.iter().map(|(_, n, _)| n.as_str()).collect();
+        for sha in [SHA_A, SHA_B] {
+            assert!(
+                names.iter().any(|n| n.starts_with(sha)),
+                "by-sha256 should contain entry starting with {}",
+                sha
+            );
+        }
+    }
+
+    // ============== Scenario 17: build_by_sha256_only → deduplicates by sha256 ==============
+
+    #[test]
+    fn s17_build_by_sha256_only_dedup() {
+        let mut tree = Tree::new();
+        let parent = tree.add_directory(1, "all-servers");
+        let descs = vec![
+            mk_desc(SHA_A, Some("image/png"), 1700000000),
+            mk_desc(SHA_A, Some("image/png"), 1700001000),
+            mk_desc(SHA_B, Some("image/png"), 1700000000),
+        ];
+        tree.build_by_sha256_only(parent, &descs);
+
+        let by_sha = tree.lookup(parent, "by-sha256").unwrap();
+        let entries = tree.readdir(by_sha).unwrap();
+        assert_eq!(
+            entries.len(),
+            2,
+            "duplicated sha256 should be deduplicated to 2 unique entries"
+        );
+    }
+
+    // ============== Scenario 18: build_by_sha256_only → skips invalid sha256 ==============
+
+    #[test]
+    fn s18_build_by_sha256_only_skips_invalid() {
+        let mut tree = Tree::new();
+        let parent = tree.add_directory(1, "all-servers");
+        let descs = vec![
+            mk_desc("not-a-valid-hash", Some("image/png"), 1700000000),
+            mk_desc(SHA_A, Some("image/png"), 1700000000),
+        ];
+        tree.build_by_sha256_only(parent, &descs);
+
+        let by_sha = tree.lookup(parent, "by-sha256").unwrap();
+        let entries = tree.readdir(by_sha).unwrap();
+        assert_eq!(entries.len(), 1, "only valid sha256 should be present");
+        assert!(entries[0].1.starts_with(SHA_A));
     }
 }
