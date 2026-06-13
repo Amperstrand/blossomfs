@@ -23,7 +23,21 @@ use crate::cli::{Cli, Command};
 use crate::fuse::fs::BlossomFS;
 use crate::fuse::tree::Tree;
 use crate::fuse::vfiles::{MountInfo, generate_readme, generate_status};
+use crate::nostr::discovery::discover_servers;
+use crate::nostr::keys::parse_npub;
 use crate::util::path::sanitize_hostname;
+
+fn resolve_pubkey_hex(args: &cli::MountArgs) -> Option<String> {
+    if let Some(ref pk) = args.pubkey {
+        return Some(pk.clone());
+    }
+    if let Some(ref npub) = args.npub {
+        if let Ok(pk) = parse_npub(npub) {
+            return Some(pk.to_hex());
+        }
+    }
+    None
+}
 
 fn main() {
     // Initialize tracing
@@ -61,8 +75,40 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut blob_count = 0usize;
     let mut all_descriptors: Vec<crate::blossom::descriptor::BlobDescriptor> = Vec::new();
 
+    // Resolve pubkey hex from --pubkey or --npub
+    let pubkey_hex = resolve_pubkey_hex(&args);
+
+    // Discover servers via NIP-B7/BUD-03 (kind 10063) if relays are provided
+    let mut effective_servers = args.server.clone();
+    if !args.relay.is_empty() {
+        if let Some(ref pk) = pubkey_hex {
+            tracing::info!(
+                "querying {} relay(s) for kind 10063 server list (pubkey={})",
+                args.relay.len(),
+                pk
+            );
+            match rt.block_on(discover_servers(&args.relay, pk)) {
+                Ok(servers) => {
+                    tracing::info!("discovered {} server(s) via NIP-B7", servers.len());
+                    for s in &servers {
+                        if !effective_servers.contains(s) {
+                            effective_servers.push(s.clone());
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("server discovery via relays failed: {}", e);
+                }
+            }
+        } else {
+            tracing::warn!(
+                "relays provided but no --npub or --pubkey; skipping server discovery"
+            );
+        }
+    }
+
     // Create /public/ root if we have any blob sources
-    let need_public = args.manifest.is_some() || !args.server.is_empty();
+    let need_public = args.manifest.is_some() || !effective_servers.is_empty();
     let public_dir = if need_public {
         Some(tree.add_directory(tree.root(), "public"))
     } else {
@@ -84,14 +130,14 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // --- Server sources: /public/<pubkey>/servers/<host>/ and /public/<pubkey>/all-servers/ ---
-    if !args.server.is_empty() {
-        let pubkey_hex = args.pubkey.as_deref().unwrap_or("all");
+    if !effective_servers.is_empty() {
+        let pk_label = pubkey_hex.as_deref().unwrap_or("all");
 
         if let Some(pd) = public_dir {
-            let pubkey_dir = tree.add_directory(pd, pubkey_hex);
+            let pubkey_dir = tree.add_directory(pd, pk_label);
             let servers_dir = tree.add_directory(pubkey_dir, "servers");
 
-            for server_url in &args.server {
+            for server_url in &effective_servers {
                 let host = sanitize_hostname(server_url);
                 let host_dir = tree.add_directory(servers_dir, &host);
 
@@ -99,9 +145,9 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
                 tracing::info!(
                     "listing blobs from {} for pubkey={}",
                     server_url,
-                    pubkey_hex
+                    pk_label
                 );
-                match rt.block_on(client.list_all_blobs(pubkey_hex)) {
+                match rt.block_on(client.list_all_blobs(pk_label)) {
                     Ok(descriptors) => {
                         tracing::info!("listed {} blobs from {}", descriptors.len(), server_url);
                         blob_count += descriptors.len();
@@ -124,7 +170,7 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Add virtual files
     let npub_display = args.npub.as_deref().unwrap_or("all");
-    let server_count = args.server.len();
+    let server_count = effective_servers.len();
     let mount_info = MountInfo {
         mountpoint: args.mountpoint.display().to_string(),
         npub: npub_display.to_string(),
