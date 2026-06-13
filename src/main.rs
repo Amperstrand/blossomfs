@@ -62,16 +62,16 @@ fn add_drive_file(
     size: u64,
     mime: Option<&str>,
     servers: &[String],
-) {
+) -> bool {
     if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
         tracing::warn!("skipping drive file with invalid sha256: {}", sha256);
-        return;
+        return false;
     }
 
     let trimmed = path.trim_start_matches('/');
     let parts: Vec<&str> = trimmed.split('/').collect();
     if parts.is_empty() {
-        return;
+        return false;
     }
 
     let mut current = root;
@@ -84,7 +84,7 @@ fn add_drive_file(
 
     if let Some(&filename) = parts.last() {
         if filename.is_empty() {
-            return;
+            return false;
         }
         let url = servers
             .first()
@@ -98,6 +98,9 @@ fn add_drive_file(
             size,
             mime.map(|s| s.to_string()),
         );
+        true
+    } else {
+        false
     }
 }
 
@@ -268,7 +271,7 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
                     for entry in &drive.entries {
                         match entry {
                             DriveEntry::File(f) => {
-                                add_drive_file(
+                                if add_drive_file(
                                     &mut tree,
                                     drive_inode,
                                     &f.path,
@@ -276,8 +279,9 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
                                     f.size.unwrap_or(0),
                                     f.mime.as_deref(),
                                     &effective_servers,
-                                );
-                                blob_count += 1;
+                                ) {
+                                    blob_count += 1;
+                                }
                             }
                             DriveEntry::Folder(fl) => {
                                 ensure_drive_path(&mut tree, drive_inode, &fl.path);

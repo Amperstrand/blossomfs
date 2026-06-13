@@ -71,17 +71,17 @@ pub fn read_cached(base: &Path, sha256: &str) -> Result<Vec<u8>, CacheError> {
 }
 
 /// Compute the temp file path for downloading (before atomic rename)
-/// Layout: <base>/.tmp/<random_hex>
-pub fn temp_path(base: &Path) -> PathBuf {
-    // Use timestamp + PID for uniqueness in PoC
+/// Layout: <base>/.tmp/<sha256_prefix>_<timestamp>_<pid>
+pub fn temp_path(base: &Path, sha256: &str) -> PathBuf {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
     let pid = std::process::id();
-    let random_hex = format!("{:x}{:x}", timestamp, pid);
+    let prefix = &sha256[..8.min(sha256.len())];
+    let name = format!("{}_{}_{}", prefix, timestamp, pid);
 
-    base.join(".tmp").join(random_hex)
+    base.join(".tmp").join(name)
 }
 
 /// Ensure the cache directory structure exists for a given sha256.
@@ -200,10 +200,11 @@ mod tests {
     #[test]
     fn test_temp_path() {
         let base = Path::new("/cache");
-        let path = temp_path(base);
+        let path = temp_path(base, VALID_HASH);
         assert!(path.starts_with(base.join(".tmp")));
         let path_str = path.to_str().unwrap();
         assert!(path_str.contains(".tmp/"));
+        assert!(path_str.contains("abcdef12"));
     }
 
     #[test]

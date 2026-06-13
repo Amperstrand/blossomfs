@@ -100,7 +100,7 @@ pub async fn fetch_and_cache(
 
     // Write to temp file, then atomic rename (POSIX rename is atomic on same filesystem)
     let cache_file = cache_path(cache_base, expected_sha256)?;
-    let temp = temp_path(cache_base);
+    let temp = temp_path(cache_base, expected_sha256);
 
     // Ensure .tmp directory exists
     if let Some(parent) = temp.parent() {

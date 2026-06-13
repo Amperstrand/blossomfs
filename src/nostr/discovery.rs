@@ -55,6 +55,7 @@ fn extract_server_urls(tags: &[(&str, Option<&str>)]) -> Vec<String> {
     tags.iter()
         .filter(|(kind, _)| *kind == "server")
         .filter_map(|(_, content)| content.map(|c| c.to_string()))
+        .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
         .collect()
 }
 
