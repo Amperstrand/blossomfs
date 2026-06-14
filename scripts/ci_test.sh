@@ -179,7 +179,7 @@ info "Mounting BlossomFS at $MOUNTPOINT..."
   --server "$SERVER" \
   --pubkey "$PUBKEY" \
   --mountpoint "$MOUNTPOINT" \
-  --read-only &
+  --read-only=true &
 BFS_PID=$!
 sleep 3
 
