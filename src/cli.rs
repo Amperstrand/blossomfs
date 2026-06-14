@@ -205,6 +205,27 @@ mod tests {
         let expected_cache_dir = PathBuf::from("/tmp/blossomfs");
         assert_eq!(mount_args.cache_dir, expected_cache_dir);
     }
+
+    #[test]
+    fn s11_ttl_secs_default_is_one_year() {
+        let args = vec!["blossomfs", "mount", "--mountpoint", "/mnt/test"];
+        let mount_args = parse_mount_args(&args).unwrap();
+        assert_eq!(mount_args.ttl_secs, 31536000);
+    }
+
+    #[test]
+    fn s12_ttl_secs_custom_value() {
+        let args = vec![
+            "blossomfs",
+            "mount",
+            "--mountpoint",
+            "/mnt/test",
+            "--ttl-secs",
+            "60",
+        ];
+        let mount_args = parse_mount_args(&args).unwrap();
+        assert_eq!(mount_args.ttl_secs, 60);
+    }
 }
 
 /// CLI arguments for blossomfs
@@ -268,6 +289,13 @@ pub struct MountArgs {
     /// Nostr relay URL for server discovery (repeatable)
     #[arg(long)]
     pub relay: Vec<String>,
+
+    /// FUSE entry/attribute cache TTL in seconds.
+    ///
+    /// Since Blossom blobs are content-addressed (immutable), a long TTL is
+    /// safe. Default is 31536000 (1 year). Use a lower value for debugging.
+    #[arg(long, default_value_t = 31536000)]
+    pub ttl_secs: u64,
 }
 
 impl Default for MountArgs {
@@ -283,6 +311,7 @@ impl Default for MountArgs {
             nsec_file: None,
             dangerous_nsec_arg: None,
             relay: Vec::new(),
+            ttl_secs: 31536000,
         }
     }
 }

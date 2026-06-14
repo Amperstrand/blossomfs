@@ -13,6 +13,7 @@ mod nostr;
 mod util;
 
 use std::path::Path;
+use std::time::Duration;
 
 use clap::Parser;
 use fuser::MountOption;
@@ -385,14 +386,26 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
         (Some(k), Some(s), false) => {
             tracing::info!("mounting in RW mode (upload server: {})", s);
             (
-                BlossomFS::new_rw(tree, args.cache_dir.clone(), handle, k, s),
+                BlossomFS::new_rw(
+                    tree,
+                    args.cache_dir.clone(),
+                    handle,
+                    k,
+                    s,
+                    Duration::from_secs(args.ttl_secs),
+                ),
                 true,
             )
         }
         _ => {
             tracing::info!("mounting in read-only mode");
             (
-                BlossomFS::new_with_cache(tree, args.cache_dir.clone(), handle),
+                BlossomFS::new_with_cache(
+                    tree,
+                    args.cache_dir.clone(),
+                    handle,
+                    Duration::from_secs(args.ttl_secs),
+                ),
                 false,
             )
         }

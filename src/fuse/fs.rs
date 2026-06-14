@@ -27,7 +27,7 @@ use fuser::{
     BsdFileFlags, CopyFileRangeFlags, Errno, FileAttr, FileHandle, FileType, Filesystem,
     FopenFlags, Generation, INodeNo, KernelConfig, LockOwner, OpenFlags, RenameFlags, ReplyAttr,
     ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs,
-    ReplyWrite, Request, TimeOrNow, WriteFlags,
+    ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 
 use nostr_sdk::prelude::Keys;
@@ -36,9 +36,6 @@ use sha2::{Digest, Sha256};
 use crate::blossom::client::BlossomClient;
 use crate::fuse::tree::{FileContent, NodeKind, Tree, TreeNode};
 use crate::nostr::auth::create_upload_auth_header;
-
-/// FUSE attribute/entry cache TTL for a read-only filesystem.
-const TTL: Duration = Duration::from_secs(1);
 
 // ---------------------------------------------------------------------------
 // WriteBuffer
@@ -53,6 +50,8 @@ struct WriteBuffer {
     /// Whether the data has already been uploaded (flush may fire
     /// multiple times due to fork/dup; we only upload once).
     flushed: bool,
+    /// When true (O_APPEND), writes ignore the offset and append to the end.
+    append: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -73,11 +72,12 @@ pub struct BlossomFS {
     server_url: Option<String>,
     read_only: bool,
     next_fh: AtomicU64,
+    ttl: Duration,
 }
 
 impl BlossomFS {
     /// Create a new read-only filesystem wrapper around the given tree.
-    pub fn new(tree: Tree) -> Self {
+    pub fn new(tree: Tree, ttl: Duration) -> Self {
         Self {
             tree: Arc::new(RwLock::new(tree)),
             cache_base: None,
@@ -87,6 +87,7 @@ impl BlossomFS {
             server_url: None,
             read_only: true,
             next_fh: AtomicU64::new(1),
+            ttl,
         }
     }
 
@@ -100,6 +101,7 @@ impl BlossomFS {
         tree: Tree,
         cache_base: PathBuf,
         runtime_handle: tokio::runtime::Handle,
+        ttl: Duration,
     ) -> Self {
         Self {
             tree: Arc::new(RwLock::new(tree)),
@@ -110,6 +112,7 @@ impl BlossomFS {
             server_url: None,
             read_only: true,
             next_fh: AtomicU64::new(1),
+            ttl,
         }
     }
 
@@ -124,6 +127,7 @@ impl BlossomFS {
         runtime_handle: tokio::runtime::Handle,
         keys: Keys,
         server_url: String,
+        ttl: Duration,
     ) -> Self {
         Self {
             tree: Arc::new(RwLock::new(tree)),
@@ -134,6 +138,7 @@ impl BlossomFS {
             server_url: Some(server_url),
             read_only: false,
             next_fh: AtomicU64::new(1),
+            ttl,
         }
     }
 
@@ -398,7 +403,7 @@ impl Filesystem for BlossomFS {
         };
         match self.lookup_child(parent.0, name_str) {
             Some(ino) => match self.make_fileattr(ino) {
-                Some(attr) => reply.entry(&TTL, &attr, Generation(0)),
+                Some(attr) => reply.entry(&self.ttl, &attr, Generation(0)),
                 None => reply.error(Errno::ENOENT),
             },
             None => reply.error(Errno::ENOENT),
@@ -407,21 +412,79 @@ impl Filesystem for BlossomFS {
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         match self.make_fileattr(ino.0) {
-            Some(attr) => reply.attr(&TTL, &attr),
+            Some(attr) => reply.attr(&self.ttl, &attr),
             None => reply.error(Errno::ENOENT),
         }
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        let is_writable = !self.read_only && flags.0 & 0o3 != 0;
+
+        if !is_writable {
             let tree = self.tree.read().unwrap();
             if tree.get(ino.0).is_none() {
                 drop(tree);
                 reply.error(Errno::ENOENT);
                 return;
             }
+            drop(tree);
+            reply.opened(FileHandle(0), FopenFlags::empty());
+            return;
         }
-        reply.opened(FileHandle(0), FopenFlags::empty());
+
+        let o_trunc = flags.0 & 0o1000 != 0;
+        let o_append = flags.0 & 0o2000 != 0;
+
+        let initial_data = {
+            let tree = self.tree.read().unwrap();
+            match tree.get(ino.0) {
+                None => {
+                    drop(tree);
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+                Some(TreeNode::Directory { .. }) => {
+                    drop(tree);
+                    reply.error(Errno::EISDIR);
+                    return;
+                }
+                Some(TreeNode::File { content, .. }) => match content {
+                    FileContent::Static(data) => {
+                        if o_trunc {
+                            Vec::new()
+                        } else {
+                            data.clone()
+                        }
+                    }
+                    FileContent::Remote { .. } => {
+                        drop(tree);
+                        reply.error(Errno::EACCES);
+                        return;
+                    }
+                },
+            }
+        };
+
+        let fh = self.next_fh.fetch_add(1, Ordering::SeqCst);
+
+        self.write_state.lock().unwrap().insert(
+            fh,
+            WriteBuffer {
+                ino: ino.0,
+                parent: 0,
+                name: String::new(),
+                data: initial_data,
+                flushed: false,
+                append: o_append,
+            },
+        );
+
+        if o_trunc {
+            let mut tree = self.tree.write().unwrap();
+            tree.update_file_size(ino.0, 0);
+        }
+
+        reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
     fn read(
@@ -524,7 +587,7 @@ impl Filesystem for BlossomFS {
             tree.update_file_size(ino.0, new_size);
         }
         match self.make_fileattr(ino.0) {
-            Some(attr) => reply.attr(&TTL, &attr),
+            Some(attr) => reply.attr(&self.ttl, &attr),
             None => reply.error(Errno::ENOENT),
         }
     }
@@ -580,7 +643,7 @@ impl Filesystem for BlossomFS {
         };
 
         match self.make_fileattr(ino) {
-            Some(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            Some(attr) => reply.entry(&self.ttl, &attr, Generation(0)),
             None => reply.error(Errno::EIO),
         }
     }
@@ -672,7 +735,11 @@ impl Filesystem for BlossomFS {
         _flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        reply.error(Errno::EROFS);
+        reply.error(if self.read_only {
+            Errno::EROFS
+        } else {
+            Errno::ENOSYS
+        });
     }
 
     fn link(
@@ -683,7 +750,11 @@ impl Filesystem for BlossomFS {
         _newname: &OsStr,
         reply: ReplyEntry,
     ) {
-        reply.error(Errno::EROFS);
+        reply.error(if self.read_only {
+            Errno::EROFS
+        } else {
+            Errno::ENOSYS
+        });
     }
 
     fn write(
@@ -713,11 +784,16 @@ impl Filesystem for BlossomFS {
                     return;
                 }
             };
-            let end = offset as usize + data.len();
+            let effective_offset = if buf.append {
+                buf.data.len() as u64
+            } else {
+                offset
+            };
+            let end = effective_offset as usize + data.len();
             if buf.data.len() < end {
                 buf.data.resize(end, 0);
             }
-            buf.data[offset as usize..end].copy_from_slice(data);
+            buf.data[effective_offset as usize..end].copy_from_slice(data);
             (buf.ino, buf.data.len() as u64)
         };
 
@@ -814,7 +890,7 @@ impl Filesystem for BlossomFS {
         name: &OsStr,
         _mode: u32,
         _umask: u32,
-        _flags: i32,
+        flags: i32,
         reply: ReplyCreate,
     ) {
         if self.read_only {
@@ -846,12 +922,18 @@ impl Filesystem for BlossomFS {
                     return;
                 }
             }
-            if tree.lookup(parent.0, name_str).is_some() {
-                drop(tree);
-                reply.error(Errno::EEXIST);
-                return;
+            if let Some(existing_ino) = tree.lookup(parent.0, name_str) {
+                if flags & 0o1000 != 0 {
+                    tree.update_file_node(existing_ino, FileContent::Static(vec![]), 0, now);
+                    existing_ino
+                } else {
+                    drop(tree);
+                    reply.error(Errno::EEXIST);
+                    return;
+                }
+            } else {
+                tree.add_file_to_dir(parent.0, name_str, FileContent::Static(vec![]), 0, now)
             }
-            tree.add_file_to_dir(parent.0, name_str, FileContent::Static(vec![]), 0, now)
         };
 
         self.write_state.lock().unwrap().insert(
@@ -862,12 +944,13 @@ impl Filesystem for BlossomFS {
                 name: name_str.to_string(),
                 data: Vec::new(),
                 flushed: false,
+                append: flags & 0o2000 != 0,
             },
         );
 
         match self.make_fileattr(ino) {
             Some(attr) => reply.created(
-                &TTL,
+                &self.ttl,
                 &attr,
                 Generation(0),
                 FileHandle(fh),
@@ -904,6 +987,17 @@ impl Filesystem for BlossomFS {
         reply: ReplyWrite,
     ) {
         reply.error(Errno::EROFS);
+    }
+
+    fn getxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _size: u32,
+        reply: ReplyXattr,
+    ) {
+        reply.error(Errno::ENODATA);
     }
 
     fn setxattr(
@@ -955,14 +1049,14 @@ mod tests {
             Some("application/octet-stream".to_string()),
             1700000000,
         );
-        BlossomFS::new(tree)
+        BlossomFS::new(tree, Duration::from_secs(1))
     }
 
     // ============== S1: Empty tree root exists ==============
 
     #[test]
     fn s01_root_exists() {
-        let fs = BlossomFS::new(Tree::new());
+        let fs = BlossomFS::new(Tree::new(), Duration::from_secs(1));
         assert_eq!(fs.tree.read().unwrap().root(), 1);
         assert!(fs.tree.read().unwrap().get(1).is_some());
     }
@@ -971,7 +1065,7 @@ mod tests {
 
     #[test]
     fn s02_getattr_root() {
-        let fs = BlossomFS::new(Tree::new());
+        let fs = BlossomFS::new(Tree::new(), Duration::from_secs(1));
         let attr = fs.make_fileattr(1).expect("root attr should exist");
         assert_eq!(attr.ino, INodeNo(1));
         assert_eq!(attr.kind, FileType::Directory);
@@ -987,7 +1081,7 @@ mod tests {
 
     #[test]
     fn s03_getattr_nonexistent() {
-        let fs = BlossomFS::new(Tree::new());
+        let fs = BlossomFS::new(Tree::new(), Duration::from_secs(1));
         assert!(fs.make_fileattr(999).is_none());
     }
 
@@ -995,7 +1089,7 @@ mod tests {
 
     #[test]
     fn s04_lookup_nonexistent() {
-        let fs = BlossomFS::new(Tree::new());
+        let fs = BlossomFS::new(Tree::new(), Duration::from_secs(1));
         assert_eq!(fs.lookup_child(1, "nonexistent"), None);
     }
 
@@ -1196,7 +1290,7 @@ mod tests {
     }
 
     fn make_cache_fs(tree: Tree, cache_base: PathBuf, handle: tokio::runtime::Handle) -> BlossomFS {
-        BlossomFS::new_with_cache(tree, cache_base, handle)
+        BlossomFS::new_with_cache(tree, cache_base, handle, Duration::from_secs(1))
     }
 
     // ============== S18: Remote file with cache — fetch and return content ==============
@@ -1376,6 +1470,7 @@ mod tests {
             handle,
             keys,
             "http://localhost:8080".to_string(),
+            Duration::from_secs(1),
         );
         (rt, fs)
     }
@@ -1398,6 +1493,7 @@ mod tests {
                     name: "test.txt".to_string(),
                     data: Vec::new(),
                     flushed: false,
+                    append: false,
                 },
             );
         }
@@ -1640,6 +1736,7 @@ mod tests {
             name: "failed.bin".to_string(),
             data: b"lost data".to_vec(),
             flushed: false,
+            append: false,
         };
 
         {

@@ -187,11 +187,17 @@ impl BlossomClient {
     ) -> Result<BlobDescriptor, BlossomClientError> {
         let url = format!("{}/upload", self.base_url);
 
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&data);
+        let sha256_hex = format!("{:x}", hasher.finalize());
+
         let response = self
             .client
             .put(&url)
             .header("Authorization", format!("Nostr {auth_header}"))
             .header("Content-Type", "application/octet-stream")
+            .header("X-SHA-256", &sha256_hex)
             .body(data)
             .send()
             .await?;
@@ -645,6 +651,37 @@ mod tests {
         assert!(
             result.is_ok(),
             "expected Ok (content-type matched), got {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upload_blob_sends_sha256_header() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload"))
+            .and(header(
+                "X-SHA-256",
+                "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "url": "https://cdn.example.com/sha256test",
+                "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+                "size": 5,
+                "type": "application/octet-stream",
+                "uploaded": 1
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let data = b"hello".to_vec();
+        let result = client.upload_blob(data, "tok").await;
+
+        assert!(
+            result.is_ok(),
+            "expected Ok (X-SHA-256 header matched), got {:?}",
             result.err()
         );
     }
