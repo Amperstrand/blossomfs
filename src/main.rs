@@ -393,6 +393,7 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
                     k,
                     s,
                     Duration::from_secs(args.ttl_secs),
+                    (args.max_write_mb as usize) * 1024 * 1024,
                 ),
                 true,
             )

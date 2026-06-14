@@ -291,6 +291,48 @@ kill "$BFS_RW_PID" 2>/dev/null
 wait "$BFS_RW_PID" 2>/dev/null || true
 fusermount3 -u "$MOUNTPOINT" 2>/dev/null || true
 
+# ─── Scenario 6: --max-write-mb rejects oversized writes ────────────────────
+echo ""
+echo "━━━ Scenario 6: --max-write-mb=1 rejects oversized writes ━━━"
+
+info "Mounting BlossomFS in RW mode with --max-write-mb=1..."
+"$BLOSSOMFS_BIN" mount \
+  --server "$SERVER" \
+  --pubkey "$PUBKEY" \
+  --mountpoint "$MOUNTPOINT" \
+  --read-only=false \
+  --nsec-file "${WORKDIR}/test-nsec.txt" \
+  --max-write-mb=1 &
+BFS_LIMIT_PID=$!
+sleep 3
+
+kill -0 "$BFS_LIMIT_PID" 2>/dev/null || fail "BlossomFS limit mount failed"
+
+for i in $(seq 1 10); do
+  [ -f "${MOUNTPOINT}/STATUS.txt" ] && break
+  sleep 1
+done
+[ -f "${MOUNTPOINT}/STATUS.txt" ] || fail "STATUS.txt not found in limit mount"
+
+# 512 KB write should succeed under 1 MB limit
+if dd if=/dev/zero bs=512K count=1 of="${MOUNTPOINT}/limit-small.bin" status=none 2>/dev/null; then
+  pass "512 KB write succeeded under --max-write-mb=1"
+else
+  fail "512 KB write should succeed under --max-write-mb=1"
+fi
+
+# 2 MB write should fail (EFBIG)
+if dd if=/dev/zero bs=2M count=1 of="${MOUNTPOINT}/limit-large.bin" status=none 2>/dev/null; then
+  fail "2 MB write should be rejected under --max-write-mb=1"
+else
+  pass "2 MB write rejected under --max-write-mb=1 (EFBIG)"
+fi
+
+info "Unmounting limit mount..."
+kill "$BFS_LIMIT_PID" 2>/dev/null
+wait "$BFS_LIMIT_PID" 2>/dev/null || true
+fusermount3 -u "$MOUNTPOINT" 2>/dev/null || true
+
 # ─── Summary ────────────────────────────────────────────────────────────────
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

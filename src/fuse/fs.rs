@@ -33,7 +33,7 @@ use fuser::{
 use nostr_sdk::prelude::Keys;
 use sha2::{Digest, Sha256};
 
-use crate::blossom::client::BlossomClient;
+use crate::blossom::client::{BlossomClient, BlossomClientError};
 use crate::fuse::tree::{FileContent, NodeKind, Tree, TreeNode};
 use crate::nostr::auth::create_upload_auth_header;
 
@@ -73,6 +73,8 @@ pub struct BlossomFS {
     read_only: bool,
     next_fh: AtomicU64,
     ttl: Duration,
+    /// Maximum writable bytes per file. Writes exceeding this return EFBIG.
+    max_write_bytes: usize,
 }
 
 impl BlossomFS {
@@ -88,6 +90,7 @@ impl BlossomFS {
             read_only: true,
             next_fh: AtomicU64::new(1),
             ttl,
+            max_write_bytes: 100 * 1024 * 1024,
         }
     }
 
@@ -113,6 +116,7 @@ impl BlossomFS {
             read_only: true,
             next_fh: AtomicU64::new(1),
             ttl,
+            max_write_bytes: 100 * 1024 * 1024,
         }
     }
 
@@ -128,6 +132,7 @@ impl BlossomFS {
         keys: Keys,
         server_url: String,
         ttl: Duration,
+        max_write_bytes: usize,
     ) -> Self {
         Self {
             tree: Arc::new(RwLock::new(tree)),
@@ -139,6 +144,7 @@ impl BlossomFS {
             read_only: false,
             next_fh: AtomicU64::new(1),
             ttl,
+            max_write_bytes,
         }
     }
 
@@ -297,8 +303,11 @@ impl BlossomFS {
     }
 
     /// Upload buffered data to the Blossom server and update the tree node.
-    /// Returns `Err` when keys/server/runtime are missing, auth fails, or
-    /// the HTTP upload fails — caller is responsible for cleanup.
+    ///
+    /// Retries up to 3 times with exponential backoff (1 s, 2 s) on transient
+    /// failures (network errors, HTTP 5xx, 429). Permanent failures (4xx) and
+    /// auth-creation errors return immediately. Returns `Err(())` on final
+    /// failure — caller is responsible for cleanup.
     fn do_upload(&self, ino: u64, data: Vec<u8>) -> Result<(), ()> {
         let (keys, server_url, handle) = match (&self.keys, &self.server_url, &self.runtime_handle)
         {
@@ -309,9 +318,10 @@ impl BlossomFS {
             }
         };
 
+        let data_len = data.len();
         let sha256_hex = hex::encode(Sha256::digest(&data));
 
-        let auth_header = match create_upload_auth_header(keys, &sha256_hex, data.len() as u64) {
+        let auth_header = match create_upload_auth_header(keys, &sha256_hex, data_len as u64) {
             Ok(h) => h,
             Err(e) => {
                 tracing::error!("auth creation failed: {}", e);
@@ -319,28 +329,91 @@ impl BlossomFS {
             }
         };
 
+        tracing::info!(
+            "uploading {} bytes for inode {} (sha256={}…)",
+            data_len,
+            ino,
+            &sha256_hex[..16]
+        );
+
         let client = BlossomClient::new(server_url);
-        match handle.block_on(client.upload_blob(data, &auth_header)) {
-            Ok(desc) => {
-                tracing::info!("uploaded blob: sha256={} size={}", desc.sha256, desc.size);
-                let mut tree = self.tree.write().unwrap();
-                tree.update_file_node(
-                    ino,
-                    FileContent::Remote {
-                        url: desc.url,
-                        sha256: desc.sha256,
-                        mime_type: desc.mime_type,
-                    },
-                    desc.size,
-                    desc.uploaded,
-                );
-                Ok(())
-            }
-            Err(e) => {
-                tracing::error!("upload failed: {}", e);
-                Err(())
+        const MAX_ATTEMPTS: u32 = 3;
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            let result = handle.block_on(client.upload_blob(data.clone(), &auth_header));
+
+            match result {
+                Ok(desc) => {
+                    tracing::info!(
+                        "upload complete: {} bytes → {} (sha256={})",
+                        desc.size,
+                        desc.url,
+                        &desc.sha256[..16]
+                    );
+                    let mut tree = self.tree.write().unwrap();
+                    tree.update_file_node(
+                        ino,
+                        FileContent::Remote {
+                            url: desc.url,
+                            sha256: desc.sha256,
+                            mime_type: desc.mime_type,
+                        },
+                        desc.size,
+                        desc.uploaded,
+                    );
+                    return Ok(());
+                }
+                Err(BlossomClientError::ServerError { status, ref body }) => {
+                    if is_retryable_status(status) && attempt < MAX_ATTEMPTS {
+                        let delay = 1u64 << (attempt - 1);
+                        tracing::warn!(
+                            "upload attempt {}/{} got HTTP {}, retrying in {}s",
+                            attempt,
+                            MAX_ATTEMPTS,
+                            status,
+                            delay
+                        );
+                        std::thread::sleep(Duration::from_secs(delay));
+                        continue;
+                    }
+                    match status {
+                        402 => tracing::error!(
+                            "upload failed: HTTP 402 Payment Required — \
+                             server demands payment for {} bytes",
+                            data_len
+                        ),
+                        413 => tracing::error!(
+                            "upload failed: HTTP 413 Payload Too Large — \
+                             file exceeds server limit"
+                        ),
+                        s => tracing::error!(
+                            "upload failed: HTTP {} — {}",
+                            s,
+                            body.chars().take(200).collect::<String>()
+                        ),
+                    }
+                    return Err(());
+                }
+                Err(ref e) => {
+                    if attempt < MAX_ATTEMPTS {
+                        let delay = 1u64 << (attempt - 1);
+                        tracing::warn!(
+                            "upload attempt {}/{} network error, retrying in {}s: {}",
+                            attempt,
+                            MAX_ATTEMPTS,
+                            delay,
+                            e
+                        );
+                        std::thread::sleep(Duration::from_secs(delay));
+                        continue;
+                    }
+                    tracing::error!("upload failed after {} attempts: {}", MAX_ATTEMPTS, e);
+                    return Err(());
+                }
             }
         }
+
+        Err(())
     }
 
     /// Remove a failed write's file from the tree.
@@ -348,6 +421,10 @@ impl BlossomFS {
         let mut tree = self.tree.write().unwrap();
         tree.remove_file_from_dir(buf.parent, &buf.name);
     }
+}
+
+fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
 // ---------------------------------------------------------------------------
@@ -790,6 +867,11 @@ impl Filesystem for BlossomFS {
                 offset
             };
             let end = effective_offset as usize + data.len();
+            if end > self.max_write_bytes {
+                drop(buffers);
+                reply.error(Errno::EFBIG);
+                return;
+            }
             if buf.data.len() < end {
                 buf.data.resize(end, 0);
             }
@@ -1471,6 +1553,7 @@ mod tests {
             keys,
             "http://localhost:8080".to_string(),
             Duration::from_secs(1),
+            100 * 1024 * 1024,
         );
         (rt, fs)
     }

@@ -296,6 +296,9 @@ pub struct MountArgs {
     /// safe. Default is 31536000 (1 year). Use a lower value for debugging.
     #[arg(long, default_value_t = 31536000)]
     pub ttl_secs: u64,
+
+    #[arg(long, default_value_t = 100)]
+    pub max_write_mb: u64,
 }
 
 impl Default for MountArgs {
@@ -312,6 +315,7 @@ impl Default for MountArgs {
             dangerous_nsec_arg: None,
             relay: Vec::new(),
             ttl_secs: 31536000,
+            max_write_mb: 100,
         }
     }
 }
