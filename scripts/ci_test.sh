@@ -12,6 +12,7 @@ BLOSSOMFS_BIN="${BLOSSOMFS_BIN:-./target/release/blossomfs}"
 # Fixed test keypair (disposable, for CI only)
 SECRET="2c40c66ddcafc6fef1470f6eb21f7b7305bd3f5bb6d5f8d402f842928e6bf4db"
 PUBKEY="b36242762df892cd391dd5ac2537118cb731b57c5896eb5f8d7b88aab3759e39"
+NSEC="nsec193qvvmwu4lr0au28pahty8mmwvzm606mkm2l34qzlppf9rnt7nds4zpcqk"
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -220,6 +221,76 @@ kill "$BFS_PID" 2>/dev/null
 wait "$BFS_PID" 2>/dev/null || true
 fusermount3 -u "$MOUNTPOINT" 2>/dev/null || true
 
+# ─── Scenario 5: RW mode — write a file through BlossomFS ────────────────────
+echo ""
+echo "━━━ Scenario 5: RW mode — write file through FUSE ━━━"
+
+# Write nsec to temp file (avoids exposing in process list)
+echo "$NSEC" > "${WORKDIR}/test-nsec.txt"
+
+# Unique test content for this commit
+RW_CONTENT="blossomfs-rw-test:${GIT_SHA}"
+
+info "Mounting BlossomFS in RW mode..."
+"$BLOSSOMFS_BIN" mount \
+  --server "$SERVER" \
+  --pubkey "$PUBKEY" \
+  --mountpoint "$MOUNTPOINT" \
+  --read-only=false \
+  --nsec-file "${WORKDIR}/test-nsec.txt" &
+BFS_RW_PID=$!
+sleep 3
+
+# Verify mount is alive
+kill -0 "$BFS_RW_PID" 2>/dev/null || fail "BlossomFS RW mount failed"
+
+# Wait for mount to be ready
+for i in $(seq 1 10); do
+  [ -f "${MOUNTPOINT}/STATUS.txt" ] && break
+  sleep 1
+done
+[ -f "${MOUNTPOINT}/STATUS.txt" ] || fail "STATUS.txt not found in RW mount"
+
+# Write a small file through FUSE
+info "Writing test file through FUSE..."
+echo "$RW_CONTENT" > "${MOUNTPOINT}/rw-ci-test.txt" || fail "Write through FUSE failed"
+pass "File written through FUSE"
+
+# Compute hash of what was actually written (echo appends \n)
+RW_FILE="${MOUNTPOINT}/rw-ci-test.txt"
+RW_HASH=$(sha256sum "$RW_FILE" | cut -d' ' -f1)
+info "RW file sha256: ${RW_HASH:0:32}..."
+
+# Verify content readback
+READBACK=$(cat "$RW_FILE" 2>/dev/null || true)
+if [ "$READBACK" = "$RW_CONTENT" ]; then
+  pass "RW file content verified through FUSE readback"
+else
+  fail "RW file content mismatch: expected='$RW_CONTENT' got='$READBACK'"
+fi
+
+# Verify the blob was uploaded to the server
+info "Checking server for uploaded blob..."
+sleep 2
+SERVER_HASHES=$(nak blossom -s "$SERVER" --sec "$SECRET" list < /dev/null 2>/dev/null || true)
+if echo "$SERVER_HASHES" | grep -q "$RW_HASH"; then
+  pass "Uploaded blob found on Blossom server"
+else
+  info "WARNING: Blob not found via nak list (may be eventual consistency)"
+  # Try direct GET as fallback
+  HTTP_GET=$(curl -s -o /dev/null -w "%{http_code}" "${SERVER}/${RW_HASH}")
+  if [ "$HTTP_GET" = "200" ]; then
+    pass "Blob verified via direct GET (HTTP 200)"
+  else
+    fail "Blob not found on server (nak list and GET both failed, HTTP $HTTP_GET)"
+  fi
+fi
+
+info "Unmounting RW mount..."
+kill "$BFS_RW_PID" 2>/dev/null
+wait "$BFS_RW_PID" 2>/dev/null || true
+fusermount3 -u "$MOUNTPOINT" 2>/dev/null || true
+
 # ─── Summary ────────────────────────────────────────────────────────────────
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -236,4 +307,4 @@ else
   echo "Large blob:   (skipped — no ecash available)"
 fi
 echo ""
-echo "BlossomFS successfully mounted and read both blobs."
+echo "BlossomFS successfully mounted, read blobs, and wrote new blobs via FUSE."

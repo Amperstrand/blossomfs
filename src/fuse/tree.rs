@@ -22,6 +22,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::blossom::descriptor::BlobDescriptor;
 use crate::util::mime::extension_for_descriptor;
@@ -62,6 +63,7 @@ pub enum TreeNode {
         parent: u64,
         size: u64,
         content: FileContent,
+        uploaded: u64,
     },
 }
 
@@ -104,8 +106,8 @@ impl Tree {
         }
     }
 
-    /// Get a mutable node reference by inode number (internal helper).
-    fn get_mut(&mut self, ino: u64) -> Option<&mut TreeNode> {
+    /// Get a mutable node reference by inode number.
+    pub fn get_mut(&mut self, ino: u64) -> Option<&mut TreeNode> {
         if ino >= 1 {
             self.nodes.get_mut((ino - 1) as usize)
         } else {
@@ -177,15 +179,21 @@ impl Tree {
         }
     }
 
-    /// Allocate the next inode number.
-    fn next_ino(&self) -> u64 {
+    pub fn uploaded(&self, ino: u64) -> Option<u64> {
+        match self.get(ino)? {
+            TreeNode::File { uploaded, .. } => Some(*uploaded),
+            TreeNode::Directory { .. } => None,
+        }
+    }
+
+    pub fn next_inode(&self) -> u64 {
         (self.nodes.len() + 1) as u64
     }
 
     /// Add a directory under `parent`, returning its new inode.
     pub fn add_directory(&mut self, parent: u64, name: &str) -> u64 {
         let sanitized = sanitize_path_component(name);
-        let ino = self.next_ino();
+        let ino = self.next_inode();
         self.nodes.push(TreeNode::Directory {
             ino,
             name: sanitized,
@@ -202,13 +210,18 @@ impl Tree {
     pub fn add_static_file(&mut self, parent: u64, name: &str, content: Vec<u8>) -> u64 {
         let sanitized = sanitize_path_component(name);
         let size = content.len() as u64;
-        let ino = self.next_ino();
+        let uploaded = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let ino = self.next_inode();
         self.nodes.push(TreeNode::File {
             ino,
             name: sanitized,
             parent,
             size,
             content: FileContent::Static(content),
+            uploaded,
         });
         if let Some(TreeNode::Directory { children, .. }) = self.get_mut(parent) {
             children.push(ino);
@@ -226,9 +239,10 @@ impl Tree {
         sha256: String,
         size: u64,
         mime_type: Option<String>,
+        uploaded: u64,
     ) -> u64 {
         let sanitized = sanitize_path_component(name);
-        let ino = self.next_ino();
+        let ino = self.next_inode();
         self.nodes.push(TreeNode::File {
             ino,
             name: sanitized,
@@ -239,6 +253,7 @@ impl Tree {
                 sha256,
                 mime_type,
             },
+            uploaded,
         });
         if let Some(TreeNode::Directory { children, .. }) = self.get_mut(parent) {
             children.push(ino);
@@ -289,6 +304,7 @@ impl Tree {
                     sha.clone(),
                     desc.size,
                     desc.mime_type.clone(),
+                    desc.uploaded,
                 );
             }
 
@@ -303,6 +319,7 @@ impl Tree {
                 sha.clone(),
                 desc.size,
                 desc.mime_type.clone(),
+                desc.uploaded,
             );
 
             // by-date — group under YYYY/MM/DD.
@@ -317,6 +334,7 @@ impl Tree {
                 sha,
                 desc.size,
                 desc.mime_type.clone(),
+                desc.uploaded,
             );
         }
     }
@@ -351,8 +369,92 @@ impl Tree {
                     sha,
                     desc.size,
                     desc.mime_type.clone(),
+                    desc.uploaded,
                 );
             }
+        }
+    }
+
+    /// Update a file node's content, size, and uploaded timestamp.
+    ///
+    /// Used after a successful upload to replace pending write data with
+    /// remote blob info. Returns `true` if the node was found and updated.
+    pub fn update_file_node(
+        &mut self,
+        ino: u64,
+        content: FileContent,
+        size: u64,
+        uploaded: u64,
+    ) -> bool {
+        if let Some(node) = self.get_mut(ino)
+            && let TreeNode::File {
+                content: c,
+                size: s,
+                uploaded: u,
+                ..
+            } = node
+        {
+            *c = content;
+            *s = size;
+            *u = uploaded;
+            return true;
+        }
+        false
+    }
+
+    /// Update just the file size (for getattr during writes).
+    ///
+    /// Returns `true` if the node was found and updated.
+    pub fn update_file_size(&mut self, ino: u64, size: u64) -> bool {
+        if let Some(node) = self.get_mut(ino)
+            && let TreeNode::File { size: s, .. } = node
+        {
+            *s = size;
+            return true;
+        }
+        false
+    }
+
+    pub fn add_file_to_dir(
+        &mut self,
+        parent: u64,
+        name: &str,
+        content: FileContent,
+        size: u64,
+        uploaded: u64,
+    ) -> u64 {
+        let sanitized = sanitize_path_component(name);
+        let ino = self.next_inode();
+        self.nodes.push(TreeNode::File {
+            ino,
+            name: sanitized,
+            parent,
+            size,
+            content,
+            uploaded,
+        });
+        if let Some(TreeNode::Directory { children, .. }) = self.get_mut(parent) {
+            children.push(ino);
+        }
+        ino
+    }
+
+    pub fn remove_file_from_dir(&mut self, parent: u64, name: &str) -> bool {
+        let child_ino = match self.lookup(parent, name) {
+            Some(ino) => ino,
+            None => return false,
+        };
+
+        match self.get(child_ino) {
+            Some(TreeNode::File { .. }) => {}
+            _ => return false,
+        }
+
+        if let Some(TreeNode::Directory { children, .. }) = self.get_mut(parent) {
+            children.retain(|&c| c != child_ino);
+            true
+        } else {
+            false
         }
     }
 }
@@ -468,6 +570,7 @@ mod tests {
             SHA_A.to_string(),
             100,
             Some("image/png".to_string()),
+            1700000000,
         );
         assert_eq!(tree.lookup(1, "abc.png"), Some(ino));
         match tree.get(ino).unwrap() {
@@ -767,5 +870,134 @@ mod tests {
         let entries = tree.readdir(by_sha).unwrap();
         assert_eq!(entries.len(), 1, "only valid sha256 should be present");
         assert!(entries[0].1.starts_with(SHA_A));
+    }
+
+    // ============== Scenario 19: add_file_to_dir creates file ==============
+
+    #[test]
+    fn s19_add_file_to_dir_creates_file() {
+        let mut tree = Tree::new();
+        let uploaded = 1700000000u64;
+        let ino = tree.add_file_to_dir(
+            1,
+            "newfile.bin",
+            FileContent::Static(b"payload".to_vec()),
+            7,
+            uploaded,
+        );
+        assert_eq!(tree.lookup(1, "newfile.bin"), Some(ino));
+        assert_eq!(tree.size(ino), Some(7));
+        assert_eq!(tree.uploaded(ino), Some(uploaded));
+        assert_eq!(tree.kind(ino), Some(NodeKind::File));
+    }
+
+    // ============== Scenario 20: remove_file_from_dir removes file ==============
+
+    #[test]
+    fn s20_remove_file_from_dir_removes_file() {
+        let mut tree = Tree::new();
+        tree.add_file_to_dir(
+            1,
+            "temp.bin",
+            FileContent::Static(b"x".to_vec()),
+            1,
+            1700000000,
+        );
+        assert!(
+            tree.lookup(1, "temp.bin").is_some(),
+            "file should exist before removal"
+        );
+
+        let removed = tree.remove_file_from_dir(1, "temp.bin");
+        assert!(removed, "remove should return true for existing file");
+        assert_eq!(
+            tree.lookup(1, "temp.bin"),
+            None,
+            "file should not be found after removal"
+        );
+    }
+
+    // ============== Scenario 21: remove_file_from_dir on nonexistent returns false ==============
+
+    #[test]
+    fn s21_remove_file_from_dir_nonexistent_returns_false() {
+        let mut tree = Tree::new();
+        let removed = tree.remove_file_from_dir(1, "ghost.bin");
+        assert!(!removed, "removing nonexistent file should return false");
+    }
+
+    // ============== Scenario 22: remove_file_from_dir on directory name returns false ==============
+
+    #[test]
+    fn s22_remove_file_from_dir_directory_returns_false() {
+        let mut tree = Tree::new();
+        tree.add_directory(1, "subdir");
+
+        let removed = tree.remove_file_from_dir(1, "subdir");
+        assert!(!removed, "removing a directory should return false");
+
+        assert!(
+            tree.lookup(1, "subdir").is_some(),
+            "directory should still exist after failed remove"
+        );
+    }
+
+    // ============== Scenario 23: next_inode increments correctly ==============
+
+    #[test]
+    fn s23_next_inode_increments() {
+        let mut tree = Tree::new();
+        assert_eq!(
+            tree.next_inode(),
+            2,
+            "after root only, next inode should be 2"
+        );
+
+        tree.add_directory(1, "dir1");
+        assert_eq!(
+            tree.next_inode(),
+            3,
+            "after adding one dir, next inode should be 3"
+        );
+
+        tree.add_static_file(1, "file.txt", b"hi".to_vec());
+        assert_eq!(
+            tree.next_inode(),
+            4,
+            "after adding a file, next inode should be 4"
+        );
+
+        tree.add_file_to_dir(1, "f2", FileContent::Static(b"y".to_vec()), 1, 0);
+        assert_eq!(
+            tree.next_inode(),
+            5,
+            "after add_file_to_dir, next inode should be 5"
+        );
+    }
+
+    // ============== Scenario 24: uploaded accessor ==============
+
+    #[test]
+    fn s24_uploaded_accessor() {
+        let mut tree = Tree::new();
+        let dir_ino = tree.add_directory(1, "dir");
+        let file_ino = tree.add_remote_file(
+            1,
+            "blob.png",
+            "https://cdn.example.com/blob".to_string(),
+            SHA_A.to_string(),
+            42,
+            Some("image/png".to_string()),
+            1700000123,
+        );
+
+        assert_eq!(tree.uploaded(file_ino), Some(1700000123));
+        assert_eq!(tree.uploaded(dir_ino), None, "directory should return None");
+        assert_eq!(tree.uploaded(1), None, "root directory should return None");
+        assert_eq!(
+            tree.uploaded(999),
+            None,
+            "nonexistent inode should return None"
+        );
     }
 }

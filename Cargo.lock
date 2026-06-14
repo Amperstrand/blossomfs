@@ -227,6 +227,7 @@ dependencies = [
 name = "blossomfs"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
  "fuser",
  "hex",

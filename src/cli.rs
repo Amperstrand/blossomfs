@@ -87,6 +87,7 @@ mod tests {
             "--mountpoint",
             "/mnt/test",
             "--read-only",
+            "true",
         ];
         let result = parse_mount_args(&args);
 
@@ -249,8 +250,8 @@ pub struct MountArgs {
     #[arg(long, default_value = "/tmp/blossomfs")]
     pub cache_dir: PathBuf,
 
-    /// Mount in read-only mode (default: true, only mode supported for now)
-    #[arg(long, default_value = "true")]
+    /// Mount in read-only mode (default: true; pass --read-only=false for RW)
+    #[arg(long, action = clap::ArgAction::Set, default_value = "true")]
     pub read_only: bool,
 
     /// Path to file containing nsec for authenticated operations

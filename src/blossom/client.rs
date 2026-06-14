@@ -160,12 +160,62 @@ impl BlossomClient {
         let bytes = response.bytes().await?;
         Ok(bytes.to_vec())
     }
+
+    /// Upload a blob using BUD-02.
+    ///
+    /// `PUT /upload`
+    ///
+    /// # Headers
+    ///
+    /// - `Authorization: Nostr <auth_header>` (base64url-encoded signed event)
+    /// - `Content-Type: application/octet-stream`
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - Raw file bytes to upload.
+    /// * `auth_header` - Base64url-encoded signed BUD-11 auth event (without
+    ///   the `Nostr ` prefix — this method adds it).
+    ///
+    /// # Returns
+    ///
+    /// The blob descriptor from the server response on success, or
+    /// `BlossomClientError::ServerError` on non-2xx responses.
+    pub async fn upload_blob(
+        &self,
+        data: Vec<u8>,
+        auth_header: &str,
+    ) -> Result<BlobDescriptor, BlossomClientError> {
+        let url = format!("{}/upload", self.base_url);
+
+        let response = self
+            .client
+            .put(&url)
+            .header("Authorization", format!("Nostr {auth_header}"))
+            .header("Content-Type", "application/octet-stream")
+            .body(data)
+            .send()
+            .await?;
+
+        let status = response.status();
+
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(BlossomClientError::ServerError {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        let body = response.text().await?;
+        let descriptor: BlobDescriptor = serde_json::from_str(&body)?;
+        Ok(descriptor)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // ── Helpers ────────────────────────────────────────────────────────────
@@ -500,6 +550,143 @@ mod tests {
 
         let client = BlossomClient::new(mock_server.uri());
         let result = client.get_blob("errorhash").await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            BlossomClientError::ServerError { status, .. } => {
+                assert_eq!(status, 500);
+            }
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+    }
+
+    // ── Scenario 14: Happy — upload_blob returns descriptor ───────────────
+
+    #[tokio::test]
+    async fn test_upload_blob_returns_descriptor() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "url": "https://cdn.example.com/abc123",
+                "sha256": "abc123",
+                "size": 13,
+                "type": "application/octet-stream",
+                "uploaded": 1700000000
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let data = b"Hello, World!".to_vec();
+        let result = client.upload_blob(data, "dummy_auth_token").await;
+
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+        let desc = result.unwrap();
+        assert_eq!(desc.sha256, "abc123");
+        assert_eq!(desc.size, 13);
+        assert_eq!(desc.url, "https://cdn.example.com/abc123");
+        assert_eq!(desc.uploaded, 1700000000);
+    }
+
+    // ── Scenario 14b: Happy — upload_blob sends Authorization header ──────
+
+    #[tokio::test]
+    async fn test_upload_blob_sends_nostr_auth_header() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload"))
+            .and(header("Authorization", "Nostr my_token_123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "url": "https://cdn.example.com/x",
+                "sha256": "x",
+                "size": 5,
+                "type": "application/octet-stream",
+                "uploaded": 1
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client.upload_blob(b"hello".to_vec(), "my_token_123").await;
+
+        // If the Authorization header didn't match, wiremock returns 404
+        assert!(
+            result.is_ok(),
+            "expected Ok (header matched), got {:?}",
+            result.err()
+        );
+    }
+
+    // ── Scenario 14c: Happy — upload_blob sends Content-Type header ───────
+
+    #[tokio::test]
+    async fn test_upload_blob_sends_content_type_header() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload"))
+            .and(header("Content-Type", "application/octet-stream"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "url": "https://cdn.example.com/y",
+                "sha256": "y",
+                "size": 1,
+                "type": "application/octet-stream",
+                "uploaded": 1
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client.upload_blob(vec![0x42], "tok").await;
+
+        assert!(
+            result.is_ok(),
+            "expected Ok (content-type matched), got {:?}",
+            result.err()
+        );
+    }
+
+    // ── Scenario 15: Edge — upload_blob 402 Payment Required ──────────────
+
+    #[tokio::test]
+    async fn test_upload_blob_402_payment_required() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(402))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client.upload_blob(b"data".to_vec(), "tok").await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            BlossomClientError::ServerError { status, .. } => {
+                assert_eq!(status, 402);
+            }
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+    }
+
+    // ── Scenario 16: Edge — upload_blob 500 → ServerError ────────────────
+
+    #[tokio::test]
+    async fn test_upload_blob_500() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client.upload_blob(b"data".to_vec(), "tok").await;
 
         assert!(result.is_err());
         match result.unwrap_err() {

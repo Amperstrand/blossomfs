@@ -25,7 +25,7 @@ use crate::fuse::fs::BlossomFS;
 use crate::fuse::tree::Tree;
 use crate::fuse::vfiles::{MountInfo, generate_readme, generate_status};
 use crate::nostr::discovery::discover_servers;
-use crate::nostr::keys::parse_npub;
+use crate::nostr::keys::{parse_npub, parse_nsec, read_nsec_file};
 use crate::nostr::legacy_drive::{DriveEntry, fetch_drive_events};
 use crate::nostr::nip94::fetch_nip94_events;
 use crate::util::path::sanitize_hostname;
@@ -97,6 +97,7 @@ fn add_drive_file(
             sha256.to_string(),
             size,
             mime.map(|s| s.to_string()),
+            0,
         );
         true
     } else {
@@ -348,17 +349,65 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Ensure cache directory exists
     std::fs::create_dir_all(&args.cache_dir)?;
 
-    // Create filesystem with cache and tokio runtime handle for lazy fetch
-    let handle = rt.handle().clone();
-    let fs = BlossomFS::new_with_cache(tree, args.cache_dir.clone(), handle);
+    // Resolve nsec for RW mode (only when --read-only=false)
+    let keys = if !args.read_only {
+        if let Some(ref path) = args.nsec_file {
+            match read_nsec_file(path) {
+                Ok(k) => Some(k),
+                Err(e) => {
+                    tracing::warn!("failed to read nsec file: {}", e);
+                    None
+                }
+            }
+        } else if let Some(ref nsec_str) = args.dangerous_nsec_arg {
+            match parse_nsec(nsec_str) {
+                Ok(k) => Some(k),
+                Err(e) => {
+                    tracing::warn!("failed to parse --dangerous-nsec-arg: {}", e);
+                    None
+                }
+            }
+        } else {
+            tracing::warn!(
+                "RW mode requires --nsec-file or --dangerous-nsec-arg, falling back to read-only"
+            );
+            None
+        }
+    } else {
+        None
+    };
 
-    // Mount options
+    let server_url = effective_servers.first().cloned();
+
+    // Create filesystem with appropriate constructor
+    let handle = rt.handle().clone();
+    let (fs, is_rw) = match (keys, server_url, args.read_only) {
+        (Some(k), Some(s), false) => {
+            tracing::info!("mounting in RW mode (upload server: {})", s);
+            (
+                BlossomFS::new_rw(tree, args.cache_dir.clone(), handle, k, s),
+                true,
+            )
+        }
+        _ => {
+            tracing::info!("mounting in read-only mode");
+            (
+                BlossomFS::new_with_cache(tree, args.cache_dir.clone(), handle),
+                false,
+            )
+        }
+    };
+
+    // Mount options — RW mode omits RO flag
     let mut options = fuser::Config::default();
-    options.mount_options = vec![
-        MountOption::RO,
+    let mut mount_opts = vec![
         MountOption::FSName("blossomfs".to_string()),
         MountOption::Subtype("blossomfs".to_string()),
     ];
+    if !is_rw {
+        mount_opts.insert(0, MountOption::RO);
+    }
+    options.mount_options = mount_opts;
 
     tracing::info!("mounting FUSE filesystem...");
     fuser::mount2(fs, &args.mountpoint, &options)?;

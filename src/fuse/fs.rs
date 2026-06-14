@@ -1,17 +1,24 @@
 //! fuser::Filesystem trait implementation.
 //!
 //! BlossomFS implements the FUSE filesystem protocol. All callbacks use
-//! `&self` (fuser 0.17.0), so mutable state (content cache) uses interior
-//! mutability via `Arc<Mutex<CacheState>>`.
+//! `&self` (fuser 0.17.0), so mutable state uses interior mutability:
+//! - The tree is wrapped in `Arc<RwLock<Tree>>` for concurrent read access
+//!   and exclusive write access during create/unlink/mkdir operations.
+//! - Write buffers (pending uploads) are tracked in
+//!   `Arc<Mutex<HashMap<u64, WriteBuffer>>>`.
 //!
-//! Stage 1 operations: lookup, getattr, readdir, open, read, statfs.
-//! Write operations return EROFS.
+//! Read-only mode (default): all write operations return EROFS.
+//! RW mode (`new_rw`): create/write/flush/mkdir/unlink are supported.
+//! On flush, buffered data is uploaded to a Blossom server via BUD-02.
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
 use crate::cache::fetch::fetch_and_cache;
@@ -23,36 +30,67 @@ use fuser::{
     ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
 
+use nostr_sdk::prelude::Keys;
+use sha2::{Digest, Sha256};
+
+use crate::blossom::client::BlossomClient;
 use crate::fuse::tree::{FileContent, NodeKind, Tree, TreeNode};
+use crate::nostr::auth::create_upload_auth_header;
 
 /// FUSE attribute/entry cache TTL for a read-only filesystem.
 const TTL: Duration = Duration::from_secs(1);
 
 // ---------------------------------------------------------------------------
+// WriteBuffer
+// ---------------------------------------------------------------------------
+
+/// Tracks data written to a file handle before upload.
+struct WriteBuffer {
+    ino: u64,
+    parent: u64,
+    name: String,
+    data: Vec<u8>,
+    /// Whether the data has already been uploaded (flush may fire
+    /// multiple times due to fork/dup; we only upload once).
+    flushed: bool,
+}
+
+// ---------------------------------------------------------------------------
 // BlossomFS struct
 // ---------------------------------------------------------------------------
 
-/// Read-only FUSE filesystem backed by a pre-built [`Tree`].
+/// FUSE filesystem backed by a pre-built [`Tree`].
 ///
-/// The tree is immutable during a mount session. All mutating FUSE operations
-/// return `EROFS`.
+/// In read-only mode (default), all mutating FUSE operations return `EROFS`.
+/// In read-write mode (constructed via [`new_rw`](Self::new_rw)), create/write
+/// callbacks buffer data and upload to a Blossom server on flush.
 pub struct BlossomFS {
-    tree: Tree,
+    tree: Arc<RwLock<Tree>>,
     cache_base: Option<PathBuf>,
     runtime_handle: Option<tokio::runtime::Handle>,
+    write_state: Arc<Mutex<HashMap<u64, WriteBuffer>>>,
+    keys: Option<Keys>,
+    server_url: Option<String>,
+    read_only: bool,
+    next_fh: AtomicU64,
 }
 
 impl BlossomFS {
-    /// Create a new filesystem wrapper around the given tree.
+    /// Create a new read-only filesystem wrapper around the given tree.
     pub fn new(tree: Tree) -> Self {
         Self {
-            tree,
+            tree: Arc::new(RwLock::new(tree)),
             cache_base: None,
             runtime_handle: None,
+            write_state: Arc::new(Mutex::new(HashMap::new())),
+            keys: None,
+            server_url: None,
+            read_only: true,
+            next_fh: AtomicU64::new(1),
         }
     }
 
-    /// Create a filesystem with lazy-fetch cache support.
+    /// Create a read-only filesystem with lazy-fetch cache support.
     ///
     /// When `cache_base` and `runtime_handle` are both set, reading a
     /// `FileContent::Remote` file triggers a lazy fetch via
@@ -64,9 +102,38 @@ impl BlossomFS {
         runtime_handle: tokio::runtime::Handle,
     ) -> Self {
         Self {
-            tree,
+            tree: Arc::new(RwLock::new(tree)),
             cache_base: Some(cache_base),
             runtime_handle: Some(runtime_handle),
+            write_state: Arc::new(Mutex::new(HashMap::new())),
+            keys: None,
+            server_url: None,
+            read_only: true,
+            next_fh: AtomicU64::new(1),
+        }
+    }
+
+    /// Create a read-write filesystem with upload support.
+    ///
+    /// Files created via the FUSE `create` callback are buffered in memory
+    /// and uploaded to `server_url` when flushed (closed). The BUD-11 auth
+    /// header is signed with `keys`.
+    pub fn new_rw(
+        tree: Tree,
+        cache_base: PathBuf,
+        runtime_handle: tokio::runtime::Handle,
+        keys: Keys,
+        server_url: String,
+    ) -> Self {
+        Self {
+            tree: Arc::new(RwLock::new(tree)),
+            cache_base: Some(cache_base),
+            runtime_handle: Some(runtime_handle),
+            write_state: Arc::new(Mutex::new(HashMap::new())),
+            keys: Some(keys),
+            server_url: Some(server_url),
+            read_only: false,
+            next_fh: AtomicU64::new(1),
         }
     }
 
@@ -76,20 +143,18 @@ impl BlossomFS {
     ///
     /// Returns `None` if the inode does not exist in the tree.
     fn make_fileattr(&self, ino: u64) -> Option<FileAttr> {
-        let node = self.tree.get(ino)?;
+        let tree = self.tree.read().unwrap();
+        let node = tree.get(ino)?;
         let now = SystemTime::now();
         match node {
             TreeNode::Directory { children, .. } => {
-                // Count child directories for root nlink calculation.
                 let child_dirs = children
                     .iter()
-                    .filter_map(|&c| self.tree.get(c))
+                    .filter_map(|&c| tree.get(c))
                     .filter(|n| matches!(n, TreeNode::Directory { .. }))
                     .count() as u32;
 
-                // Root (ino 1): nlink = 2 + number of sub-directories.
-                // Other dirs: nlink = 2 (. and ..).
-                let nlink = if ino == self.tree.root() {
+                let nlink = if ino == tree.root() {
                     2 + child_dirs
                 } else {
                     2
@@ -113,23 +178,28 @@ impl BlossomFS {
                     flags: 0,
                 })
             }
-            TreeNode::File { size, .. } => Some(FileAttr {
-                ino: INodeNo(ino),
-                size: *size,
-                blocks: (*size).div_ceil(512),
-                atime: now,
-                mtime: now,
-                ctime: now,
-                crtime: now,
-                kind: FileType::RegularFile,
-                perm: 0o444,
-                nlink: 1,
-                uid: 0,
-                gid: 0,
-                rdev: 0,
-                blksize: 512,
-                flags: 0,
-            }),
+            TreeNode::File { size, uploaded, .. } => {
+                let file_time = SystemTime::UNIX_EPOCH
+                    .checked_add(Duration::from_secs(*uploaded))
+                    .unwrap_or_else(SystemTime::now);
+                Some(FileAttr {
+                    ino: INodeNo(ino),
+                    size: *size,
+                    blocks: (*size).div_ceil(512),
+                    atime: file_time,
+                    mtime: file_time,
+                    ctime: file_time,
+                    crtime: file_time,
+                    kind: FileType::RegularFile,
+                    perm: 0o444,
+                    nlink: 1,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                    blksize: 512,
+                    flags: 0,
+                })
+            }
         }
     }
 
@@ -141,7 +211,8 @@ impl BlossomFS {
     /// - Directories: returns [`ReadError::IsDir`].
     /// - Missing inode: returns [`ReadError::NotFound`].
     fn read_content(&self, ino: u64, offset: usize, size: usize) -> Result<Vec<u8>, ReadError> {
-        let node = self.tree.get(ino).ok_or(ReadError::NotFound)?;
+        let tree = self.tree.read().unwrap();
+        let node = tree.get(ino).ok_or(ReadError::NotFound)?;
         match node {
             TreeNode::Directory { .. } => Err(ReadError::IsDir),
             TreeNode::File { content, .. } => match content {
@@ -154,6 +225,9 @@ impl BlossomFS {
                     }
                 }
                 FileContent::Remote { url, sha256, .. } => {
+                    let url = url.clone();
+                    let sha256 = sha256.clone();
+                    drop(tree);
                     let (cache_base, handle) = match (&self.cache_base, &self.runtime_handle) {
                         (Some(cb), Some(h)) => (cb, h),
                         _ => return Err(ReadError::Remote),
@@ -161,7 +235,7 @@ impl BlossomFS {
 
                     tracing::debug!("fetching blob {} from {}", sha256, url);
                     let full_data = handle
-                        .block_on(fetch_and_cache(url, sha256, cache_base))
+                        .block_on(fetch_and_cache(&url, &sha256, cache_base))
                         .map_err(|e| {
                             tracing::error!("fetch failed for {}: {}", sha256, e);
                             ReadError::Fetch
@@ -183,7 +257,8 @@ impl BlossomFS {
     ///
     /// Returns `None` if the inode is not a directory.
     fn list_directory(&self, ino: u64) -> Option<Vec<(u64, String, FileType)>> {
-        let entries = self.tree.readdir(ino)?;
+        let tree = self.tree.read().unwrap();
+        let entries = tree.readdir(ino)?;
         Some(
             entries
                 .into_iter()
@@ -200,9 +275,10 @@ impl BlossomFS {
 
     /// Total number of nodes in the tree (used for statfs `files` count).
     fn node_count(&self) -> u64 {
+        let tree = self.tree.read().unwrap();
         let mut count = 0u64;
         let mut ino = 1u64;
-        while self.tree.get(ino).is_some() {
+        while tree.get(ino).is_some() {
             count += 1;
             ino += 1;
         }
@@ -211,7 +287,61 @@ impl BlossomFS {
 
     /// Look up a child inode by name within a parent directory.
     fn lookup_child(&self, parent: u64, name: &str) -> Option<u64> {
-        self.tree.lookup(parent, name)
+        let tree = self.tree.read().unwrap();
+        tree.lookup(parent, name)
+    }
+
+    /// Upload buffered data to the Blossom server and update the tree node.
+    /// Returns `Err` when keys/server/runtime are missing, auth fails, or
+    /// the HTTP upload fails — caller is responsible for cleanup.
+    fn do_upload(&self, ino: u64, data: Vec<u8>) -> Result<(), ()> {
+        let (keys, server_url, handle) = match (&self.keys, &self.server_url, &self.runtime_handle)
+        {
+            (Some(k), Some(s), Some(h)) => (k, s, h),
+            _ => {
+                tracing::error!("upload preconditions not met (keys/server/handle)");
+                return Err(());
+            }
+        };
+
+        let sha256_hex = hex::encode(Sha256::digest(&data));
+
+        let auth_header = match create_upload_auth_header(keys, &sha256_hex, data.len() as u64) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!("auth creation failed: {}", e);
+                return Err(());
+            }
+        };
+
+        let client = BlossomClient::new(server_url);
+        match handle.block_on(client.upload_blob(data, &auth_header)) {
+            Ok(desc) => {
+                tracing::info!("uploaded blob: sha256={} size={}", desc.sha256, desc.size);
+                let mut tree = self.tree.write().unwrap();
+                tree.update_file_node(
+                    ino,
+                    FileContent::Remote {
+                        url: desc.url,
+                        sha256: desc.sha256,
+                        mime_type: desc.mime_type,
+                    },
+                    desc.size,
+                    desc.uploaded,
+                );
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!("upload failed: {}", e);
+                Err(())
+            }
+        }
+    }
+
+    /// Remove a failed write's file from the tree.
+    fn cleanup_failed_write(&self, buf: &WriteBuffer) {
+        let mut tree = self.tree.write().unwrap();
+        tree.remove_file_from_dir(buf.parent, &buf.name);
     }
 }
 
@@ -283,9 +413,13 @@ impl Filesystem for BlossomFS {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        if self.tree.get(ino.0).is_none() {
-            reply.error(Errno::ENOENT);
-            return;
+        {
+            let tree = self.tree.read().unwrap();
+            if tree.get(ino.0).is_none() {
+                drop(tree);
+                reply.error(Errno::ENOENT);
+                return;
+            }
         }
         reply.opened(FileHandle(0), FopenFlags::empty());
     }
@@ -323,10 +457,12 @@ impl Filesystem for BlossomFS {
             }
         };
 
-        // Determine parent inode for "..".
-        let parent_ino = match self.tree.get(ino.0) {
-            Some(TreeNode::Directory { parent, .. }) => *parent,
-            _ => 0,
+        let parent_ino = {
+            let tree = self.tree.read().unwrap();
+            match tree.get(ino.0) {
+                Some(TreeNode::Directory { parent, .. }) => *parent,
+                _ => 0,
+            }
         };
 
         // "." — offset 1
@@ -359,16 +495,16 @@ impl Filesystem for BlossomFS {
         reply.statfs(0, 0, 0, files, 0, 4096, 255, 4096);
     }
 
-    // ---- Write operations — all return EROFS (read-only filesystem) ----
+    // ---- Write operations ----
 
     fn setattr(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         _mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
-        _size: Option<u64>,
+        size: Option<u64>,
         _atime: Option<TimeOrNow>,
         _mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
@@ -379,7 +515,18 @@ impl Filesystem for BlossomFS {
         _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        reply.error(Errno::EROFS);
+        if self.read_only {
+            reply.error(Errno::EROFS);
+            return;
+        }
+        if let Some(new_size) = size {
+            let mut tree = self.tree.write().unwrap();
+            tree.update_file_size(ino.0, new_size);
+        }
+        match self.make_fileattr(ino.0) {
+            Some(attr) => reply.attr(&TTL, &attr),
+            None => reply.error(Errno::ENOENT),
+        }
     }
 
     fn mknod(
@@ -398,21 +545,110 @@ impl Filesystem for BlossomFS {
     fn mkdir(
         &self,
         _req: &Request,
-        _parent: INodeNo,
-        _name: &OsStr,
+        parent: INodeNo,
+        name: &OsStr,
         _mode: u32,
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        reply.error(Errno::EROFS);
+        if self.read_only {
+            reply.error(Errno::EROFS);
+            return;
+        }
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+        };
+
+        let ino = {
+            let mut tree = self.tree.write().unwrap();
+            match tree.get(parent.0) {
+                Some(TreeNode::Directory { .. }) => {}
+                _ => {
+                    reply.error(Errno::ENOTDIR);
+                    return;
+                }
+            }
+            if tree.lookup(parent.0, name_str).is_some() {
+                reply.error(Errno::EEXIST);
+                return;
+            }
+            tree.add_directory(parent.0, name_str)
+        };
+
+        match self.make_fileattr(ino) {
+            Some(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            None => reply.error(Errno::EIO),
+        }
     }
 
-    fn unlink(&self, _req: &Request, _parent: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
-        reply.error(Errno::EROFS);
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        if self.read_only {
+            reply.error(Errno::EROFS);
+            return;
+        }
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+        };
+
+        let mut tree = self.tree.write().unwrap();
+        if tree.remove_file_from_dir(parent.0, name_str) {
+            drop(tree);
+            reply.ok();
+        } else {
+            drop(tree);
+            reply.error(Errno::ENOENT);
+        }
     }
 
-    fn rmdir(&self, _req: &Request, _parent: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
-        reply.error(Errno::EROFS);
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        if self.read_only {
+            reply.error(Errno::EROFS);
+            return;
+        }
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+        };
+
+        let mut tree = self.tree.write().unwrap();
+        let child_ino = match tree.lookup(parent.0, name_str) {
+            Some(ino) => ino,
+            None => {
+                drop(tree);
+                reply.error(Errno::ENOENT);
+                return;
+            }
+        };
+        match tree.get(child_ino) {
+            Some(TreeNode::Directory { children, .. }) => {
+                if !children.is_empty() {
+                    drop(tree);
+                    reply.error(Errno::ENOTEMPTY);
+                    return;
+                }
+            }
+            _ => {
+                drop(tree);
+                reply.error(Errno::ENOTDIR);
+                return;
+            }
+        }
+        if let Some(TreeNode::Directory { children, .. }) = tree.get_mut(parent.0) {
+            children.retain(|&c| c != child_ino);
+        }
+        drop(tree);
+        reply.ok();
     }
 
     fn symlink(
@@ -454,27 +690,109 @@ impl Filesystem for BlossomFS {
         &self,
         _req: &Request,
         _ino: INodeNo,
-        _fh: FileHandle,
-        _offset: u64,
-        _data: &[u8],
+        fh: FileHandle,
+        offset: u64,
+        data: &[u8],
         _write_flags: WriteFlags,
         _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        reply.error(Errno::EROFS);
+        if self.read_only {
+            reply.error(Errno::EROFS);
+            return;
+        }
+
+        let (ino, new_size) = {
+            let mut buffers = self.write_state.lock().unwrap();
+            let buf = match buffers.get_mut(&fh.0) {
+                Some(b) => b,
+                None => {
+                    drop(buffers);
+                    reply.error(Errno::EBADF);
+                    return;
+                }
+            };
+            let end = offset as usize + data.len();
+            if buf.data.len() < end {
+                buf.data.resize(end, 0);
+            }
+            buf.data[offset as usize..end].copy_from_slice(data);
+            (buf.ino, buf.data.len() as u64)
+        };
+
+        {
+            let mut tree = self.tree.write().unwrap();
+            tree.update_file_size(ino, new_size);
+        }
+
+        reply.written(data.len() as u32);
     }
 
     fn flush(
         &self,
         _req: &Request,
         _ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
-        // flush is called on close(); for a read-only filesystem this is a no-op.
-        // Returning EROFS here would cause errors on every file close, even reads.
+        // flush() can fire multiple times per open (fork/dup). We do NOT
+        // remove the WriteBuffer here — only upload once and let release()
+        // handle final cleanup.
+
+        let mut to_upload: Option<(u64, Vec<u8>)> = None;
+
+        {
+            let mut state = self.write_state.lock().unwrap();
+            if let Some(buf) = state.get_mut(&fh.0)
+                && !buf.flushed
+                && !buf.data.is_empty()
+            {
+                buf.flushed = true;
+                to_upload = Some((buf.ino, buf.data.clone()));
+            }
+        }
+
+        match to_upload {
+            None => {
+                reply.ok();
+            }
+            Some((ino, data)) => match self.do_upload(ino, data) {
+                Ok(()) => reply.ok(),
+                Err(()) => reply.error(Errno::EIO),
+            },
+        }
+    }
+
+    fn release(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        // release() is called exactly once when all fd references are closed.
+        // This is the correct place to clean up the WriteBuffer. If flush()
+        // didn't fire (or had no data), we do a fallback upload here.
+        let buf = self.write_state.lock().unwrap().remove(&fh.0);
+
+        if let Some(buf) = buf
+            && !buf.flushed
+            && !buf.data.is_empty()
+        {
+            match self.do_upload(buf.ino, buf.data.clone()) {
+                Ok(()) => {}
+                Err(()) => {
+                    tracing::error!("fallback upload failed in release()");
+                    self.cleanup_failed_write(&buf);
+                }
+            }
+        }
+
         reply.ok();
     }
 
@@ -486,21 +804,77 @@ impl Filesystem for BlossomFS {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        // fsync on a read-only filesystem is a no-op.
         reply.ok();
     }
 
     fn create(
         &self,
         _req: &Request,
-        _parent: INodeNo,
-        _name: &OsStr,
+        parent: INodeNo,
+        name: &OsStr,
         _mode: u32,
         _umask: u32,
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        reply.error(Errno::EROFS);
+        if self.read_only {
+            reply.error(Errno::EROFS);
+            return;
+        }
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+        };
+
+        let fh = self.next_fh.fetch_add(1, Ordering::SeqCst);
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let ino = {
+            let mut tree = self.tree.write().unwrap();
+            match tree.get(parent.0) {
+                Some(TreeNode::Directory { .. }) => {}
+                _ => {
+                    drop(tree);
+                    reply.error(Errno::ENOTDIR);
+                    return;
+                }
+            }
+            if tree.lookup(parent.0, name_str).is_some() {
+                drop(tree);
+                reply.error(Errno::EEXIST);
+                return;
+            }
+            tree.add_file_to_dir(parent.0, name_str, FileContent::Static(vec![]), 0, now)
+        };
+
+        self.write_state.lock().unwrap().insert(
+            fh,
+            WriteBuffer {
+                ino,
+                parent: parent.0,
+                name: name_str.to_string(),
+                data: Vec::new(),
+                flushed: false,
+            },
+        );
+
+        match self.make_fileattr(ino) {
+            Some(attr) => reply.created(
+                &TTL,
+                &attr,
+                Generation(0),
+                FileHandle(fh),
+                FopenFlags::empty(),
+            ),
+            None => reply.error(Errno::EIO),
+        }
     }
 
     fn fallocate(
@@ -579,6 +953,7 @@ mod tests {
             "aaaa0000bbbb1111cccc2222dddd3333eeee4444ffff5555aabb0000".to_string(),
             42,
             Some("application/octet-stream".to_string()),
+            1700000000,
         );
         BlossomFS::new(tree)
     }
@@ -588,8 +963,8 @@ mod tests {
     #[test]
     fn s01_root_exists() {
         let fs = BlossomFS::new(Tree::new());
-        assert_eq!(fs.tree.root(), 1);
-        assert!(fs.tree.get(1).is_some());
+        assert_eq!(fs.tree.read().unwrap().root(), 1);
+        assert!(fs.tree.read().unwrap().get(1).is_some());
     }
 
     // ============== S2: getattr on root returns Directory 0o755 ==============
@@ -677,7 +1052,6 @@ mod tests {
     fn s07_readdir_nonexistent() {
         let fs = make_test_fs();
         assert!(fs.list_directory(999).is_none(), "nonexistent inode");
-        // readdir on a file should also return None.
         assert!(
             fs.list_directory(2).is_none(),
             "file inode is not a directory"
@@ -736,10 +1110,14 @@ mod tests {
     #[test]
     fn s12_open_existing() {
         let fs = make_test_fs();
-        // The open method is verified indirectly: the tree node exists,
-        // which is the only condition open checks before replying.
-        assert!(fs.tree.get(2).is_some(), "file inode 2 exists for open");
-        assert!(fs.tree.get(1).is_some(), "root inode 1 exists for open");
+        assert!(
+            fs.tree.read().unwrap().get(2).is_some(),
+            "file inode 2 exists for open"
+        );
+        assert!(
+            fs.tree.read().unwrap().get(1).is_some(),
+            "root inode 1 exists for open"
+        );
     }
 
     // ============== S13: statfs returns non-zero file count ==============
@@ -757,12 +1135,9 @@ mod tests {
 
     #[test]
     fn s14_read_remote_file() {
-        // make_test_fs() uses BlossomFS::new(tree) — no cache/runtime configured,
-        // so Remote reads return ReadError::Remote.
         let fs = make_test_fs();
         let result = fs.read_content(4, 0, 100);
         assert_eq!(result, Err(ReadError::Remote));
-        // Errno doesn't impl PartialEq; verify via Debug (libc::EIO = 5).
         assert_eq!(format!("{:?}", ReadError::Remote.to_errno()), "Errno(5)");
     }
 
@@ -785,7 +1160,6 @@ mod tests {
     fn s16_root_nlink_with_subdir() {
         let fs = make_test_fs();
         let attr = fs.make_fileattr(1).expect("root attr should exist");
-        // Root has 1 sub-directory ("subdir"), so nlink = 2 + 1 = 3.
         assert_eq!(attr.nlink, 3);
     }
 
@@ -793,16 +1167,13 @@ mod tests {
 
     #[test]
     fn s17_error_mappings() {
-        // Errno doesn't impl PartialEq; verify via Debug (libc errno numbers).
-        assert_eq!(format!("{:?}", ReadError::NotFound.to_errno()), "Errno(2)"); // ENOENT
-        assert_eq!(format!("{:?}", ReadError::IsDir.to_errno()), "Errno(21)"); // EISDIR
-        assert_eq!(format!("{:?}", ReadError::Remote.to_errno()), "Errno(5)"); // EIO
-        assert_eq!(format!("{:?}", ReadError::Fetch.to_errno()), "Errno(5)"); // EIO
+        assert_eq!(format!("{:?}", ReadError::NotFound.to_errno()), "Errno(2)");
+        assert_eq!(format!("{:?}", ReadError::IsDir.to_errno()), "Errno(21)");
+        assert_eq!(format!("{:?}", ReadError::Remote.to_errno()), "Errno(5)");
+        assert_eq!(format!("{:?}", ReadError::Fetch.to_errno()), "Errno(5)");
     }
 
     // ============== Lazy fetch tests (S18-S22) ==============
-
-    use sha2::{Digest, Sha256};
 
     fn sha256_hex(content: &[u8]) -> String {
         let mut hasher = Sha256::new();
@@ -810,7 +1181,6 @@ mod tests {
         hex::encode(hasher.finalize())
     }
 
-    /// Build a tree with a single Remote file pointing at `url` with the given content hash.
     fn make_cache_test_tree(url: String, sha256: String, size: u64) -> Tree {
         let mut tree = Tree::new();
         tree.add_remote_file(
@@ -820,11 +1190,11 @@ mod tests {
             sha256,
             size,
             Some("application/octet-stream".to_string()),
+            1700000000,
         );
         tree
     }
 
-    /// Build a BlossomFS with cache support for lazy-fetch tests.
     fn make_cache_fs(tree: Tree, cache_base: PathBuf, handle: tokio::runtime::Handle) -> BlossomFS {
         BlossomFS::new_with_cache(tree, cache_base, handle)
     }
@@ -858,7 +1228,6 @@ mod tests {
         let cache_dir = tempfile::tempdir().unwrap();
         let fs = make_cache_fs(tree, cache_dir.path().to_path_buf(), handle);
 
-        // remote.bin is inode 2 (root=1, file=2)
         let data = fs.read_content(2, 0, 1024).expect("should fetch and read");
         assert_eq!(data, content.to_vec());
     }
@@ -881,7 +1250,7 @@ mod tests {
             Mock::given(method("GET"))
                 .and(path("/blob19"))
                 .respond_with(ResponseTemplate::new(200).set_body_bytes(content.to_vec()))
-                .expect(1) // Only first call hits the server
+                .expect(1)
                 .mount(&server)
                 .await;
             (server.uri(), server)
@@ -893,25 +1262,21 @@ mod tests {
         let cache_dir = tempfile::tempdir().unwrap();
         let fs = make_cache_fs(tree, cache_dir.path().to_path_buf(), handle);
 
-        // First read: fetches from HTTP
         let data1 = fs
             .read_content(2, 0, 1024)
             .expect("first read should succeed");
         assert_eq!(data1, content.to_vec());
 
-        // Second read: served from cache (mock expects exactly 1 request)
         let data2 = fs
             .read_content(2, 0, 1024)
             .expect("second read should succeed");
         assert_eq!(data2, content.to_vec());
 
-        // Verify cache file exists on disk
         assert!(
             crate::cache::object_cache::cache_exists(cache_dir.path(), &hash),
             "cache file should exist on disk"
         );
 
-        // Drop the mock server handle to verify expectations were met
         drop(mock_server_handle);
     }
 
@@ -944,7 +1309,6 @@ mod tests {
         let cache_dir = tempfile::tempdir().unwrap();
         let fs = make_cache_fs(tree, cache_dir.path().to_path_buf(), handle);
 
-        // Read from offset 10, size 10 → should return "ABCDEFGHIJ"
         let data = fs
             .read_content(2, 10, 10)
             .expect("offset read should succeed");
@@ -981,7 +1345,6 @@ mod tests {
 
         let result = fs.read_content(2, 0, 100);
         assert_eq!(result, Err(ReadError::Fetch));
-        // to_errno() maps Fetch → EIO (5)
         assert_eq!(format!("{:?}", ReadError::Fetch.to_errno()), "Errno(5)");
     }
 
@@ -989,11 +1352,341 @@ mod tests {
 
     #[test]
     fn s22_remote_without_cache_returns_remote_error() {
-        // BlossomFS::new(tree) — no cache configured
         let fs = make_test_fs();
-        // make_test_fs has remote.bin at inode 4
         let result = fs.read_content(4, 0, 100);
         assert_eq!(result, Err(ReadError::Remote));
         assert_eq!(format!("{:?}", ReadError::Remote.to_errno()), "Errno(5)");
+    }
+
+    // ============== Write logic tests (S23+) ==============
+
+    /// Build a read-write filesystem for write tests.
+    /// Returns the runtime alongside so it stays alive for the test scope.
+    fn make_rw_fs() -> (tokio::runtime::Runtime, BlossomFS) {
+        let mut tree = Tree::new();
+        let _ = tree.add_static_file(1, "README.txt", b"Hello, World!".to_vec());
+        let _ = tree.add_directory(1, "subdir");
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+        let keys = Keys::generate();
+        let fs = BlossomFS::new_rw(
+            tree,
+            PathBuf::from("/tmp/blossomfs-test-cache"),
+            handle,
+            keys,
+            "http://localhost:8080".to_string(),
+        );
+        (rt, fs)
+    }
+
+    // ============== S23: WriteBuffer accumulates data across writes ==============
+
+    #[test]
+    fn s23_write_buffer_create_and_write() {
+        let fs = make_test_fs();
+        let fh = 100u64;
+
+        // Simulate create: register a write buffer
+        {
+            let mut state = fs.write_state.lock().unwrap();
+            state.insert(
+                fh,
+                WriteBuffer {
+                    ino: 5,
+                    parent: 1,
+                    name: "test.txt".to_string(),
+                    data: Vec::new(),
+                    flushed: false,
+                },
+            );
+        }
+
+        // Simulate write at offset 0: "hello"
+        {
+            let mut state = fs.write_state.lock().unwrap();
+            let buf = state.get_mut(&fh).expect("buffer should exist");
+            let data = b"hello";
+            let end = data.len();
+            buf.data.resize(end, 0);
+            buf.data[0..end].copy_from_slice(data);
+        }
+
+        // Simulate write at offset 5: " world"
+        {
+            let mut state = fs.write_state.lock().unwrap();
+            let buf = state.get_mut(&fh).expect("buffer should exist");
+            let data = b" world";
+            let end = 5 + data.len();
+            buf.data.resize(end, 0);
+            buf.data[5..end].copy_from_slice(data);
+        }
+
+        // Verify accumulated data
+        {
+            let state = fs.write_state.lock().unwrap();
+            let buf = state.get(&fh).expect("buffer should exist");
+            assert_eq!(buf.data, b"hello world");
+            assert_eq!(buf.data.len(), 11);
+        }
+    }
+
+    // ============== S24: Read-only fs rejects create (read_only flag) ==============
+
+    #[test]
+    fn s24_create_in_readonly_returns_erofs() {
+        let fs = make_test_fs();
+        assert!(fs.read_only, "default filesystem should be read-only");
+    }
+
+    // ============== S25: RW fs allows mkdir (tree mutation) ==============
+
+    #[test]
+    fn s25_mkdir_in_rw_mode() {
+        let (_rt, fs) = make_rw_fs();
+        assert!(!fs.read_only, "RW filesystem should not be read-only");
+
+        let ino = {
+            let mut tree = fs.tree.write().unwrap();
+            tree.add_directory(1, "newdir")
+        };
+
+        let tree = fs.tree.read().unwrap();
+        assert_eq!(tree.lookup(1, "newdir"), Some(ino));
+        assert_eq!(tree.kind(ino), Some(NodeKind::Directory));
+    }
+
+    // ============== S26: RW fs allows unlink (tree mutation) ==============
+
+    #[test]
+    fn s26_unlink_in_rw_mode() {
+        let (_rt, fs) = make_rw_fs();
+
+        // Add a file to delete
+        {
+            let mut tree = fs.tree.write().unwrap();
+            tree.add_file_to_dir(
+                1,
+                "todelete.bin",
+                FileContent::Static(b"data".to_vec()),
+                4,
+                0,
+            );
+        }
+
+        // Verify it exists
+        {
+            let tree = fs.tree.read().unwrap();
+            assert!(tree.lookup(1, "todelete.bin").is_some());
+        }
+
+        // Remove it (simulates unlink callback)
+        let removed = {
+            let mut tree = fs.tree.write().unwrap();
+            tree.remove_file_from_dir(1, "todelete.bin")
+        };
+        assert!(removed);
+
+        // Verify it's gone
+        {
+            let tree = fs.tree.read().unwrap();
+            assert!(tree.lookup(1, "todelete.bin").is_none());
+        }
+    }
+
+    // ============== S27: Read-only fs rejects unlink (read_only flag) ==============
+
+    #[test]
+    fn s27_unlink_in_readonly_returns_erofs() {
+        let fs = make_test_fs();
+        assert!(fs.read_only, "default filesystem should be read-only");
+    }
+
+    // ============== S28: update_file_node replaces content after upload ==============
+
+    #[test]
+    fn s28_update_file_node_replaces_content() {
+        let (_rt, fs) = make_rw_fs();
+
+        // Create a file with Static content (pending write)
+        let ino = {
+            let mut tree = fs.tree.write().unwrap();
+            tree.add_file_to_dir(1, "upload.bin", FileContent::Static(vec![0u8; 100]), 100, 0)
+        };
+
+        // Simulate flush: replace with Remote content
+        {
+            let mut tree = fs.tree.write().unwrap();
+            let updated = tree.update_file_node(
+                ino,
+                FileContent::Remote {
+                    url: "https://cdn.example.com/abc123".to_string(),
+                    sha256: "abc123".to_string(),
+                    mime_type: Some("application/octet-stream".to_string()),
+                },
+                100,
+                1700000000,
+            );
+            assert!(
+                updated,
+                "update_file_node should return true for existing file"
+            );
+        }
+
+        // Verify the node now has Remote content
+        let tree = fs.tree.read().unwrap();
+        match tree.get(ino) {
+            Some(TreeNode::File {
+                content,
+                size,
+                uploaded,
+                ..
+            }) => {
+                assert_eq!(*size, 100);
+                assert_eq!(*uploaded, 1700000000);
+                match content {
+                    FileContent::Remote { url, sha256, .. } => {
+                        assert_eq!(url, "https://cdn.example.com/abc123");
+                        assert_eq!(sha256, "abc123");
+                    }
+                    FileContent::Static(_) => panic!("expected Remote content after update"),
+                }
+            }
+            _ => panic!("expected File node"),
+        }
+    }
+
+    // ============== S29: update_file_size updates size for getattr ==============
+
+    #[test]
+    fn s29_update_file_size() {
+        let (_rt, fs) = make_rw_fs();
+
+        let ino = {
+            let mut tree = fs.tree.write().unwrap();
+            tree.add_file_to_dir(1, "growing.bin", FileContent::Static(vec![]), 0, 0)
+        };
+
+        // Update size (simulates write callback updating size)
+        {
+            let mut tree = fs.tree.write().unwrap();
+            let updated = tree.update_file_size(ino, 42);
+            assert!(updated);
+        }
+
+        let tree = fs.tree.read().unwrap();
+        assert_eq!(tree.size(ino), Some(42));
+    }
+
+    // ============== S30: update_file_node on nonexistent returns false ==============
+
+    #[test]
+    fn s30_update_file_node_nonexistent_returns_false() {
+        let (_rt, fs) = make_rw_fs();
+        let mut tree = fs.tree.write().unwrap();
+        let result = tree.update_file_node(9999, FileContent::Static(vec![]), 0, 0);
+        assert!(!result, "updating nonexistent node should return false");
+    }
+
+    // ============== S31: RW rmdir removes empty directory ==============
+
+    #[test]
+    fn s31_rmdir_in_rw_mode() {
+        let (_rt, fs) = make_rw_fs();
+
+        // Create a directory to remove
+        let dir_ino = {
+            let mut tree = fs.tree.write().unwrap();
+            tree.add_directory(1, "toRemove")
+        };
+
+        // Verify it exists and is empty
+        {
+            let tree = fs.tree.read().unwrap();
+            assert_eq!(tree.lookup(1, "toRemove"), Some(dir_ino));
+            let entries = tree.readdir(dir_ino).expect("should be a directory");
+            assert!(entries.is_empty());
+        }
+
+        // Remove it (simulates rmdir callback logic)
+        {
+            let mut tree = fs.tree.write().unwrap();
+            let child_ino = tree.lookup(1, "toRemove").expect("dir should exist");
+            if let Some(TreeNode::Directory { children, .. }) = tree.get(child_ino) {
+                assert!(children.is_empty(), "directory should be empty");
+            }
+            if let Some(TreeNode::Directory { children, .. }) = tree.get_mut(1) {
+                children.retain(|&c| c != dir_ino);
+            }
+        }
+
+        // Verify it's gone from parent's children
+        {
+            let tree = fs.tree.read().unwrap();
+            assert_eq!(tree.lookup(1, "toRemove"), None);
+        }
+    }
+
+    // ============== S32: WriteBuffer cleanup removes file from tree ==============
+
+    #[test]
+    fn s32_cleanup_failed_write_removes_file() {
+        let (_rt, fs) = make_rw_fs();
+
+        // Add a file (simulates a failed upload)
+        let buf = WriteBuffer {
+            ino: 5,
+            parent: 1,
+            name: "failed.bin".to_string(),
+            data: b"lost data".to_vec(),
+            flushed: false,
+        };
+
+        {
+            let mut tree = fs.tree.write().unwrap();
+            tree.add_file_to_dir(
+                buf.parent,
+                &buf.name,
+                FileContent::Static(b"pending".to_vec()),
+                7,
+                0,
+            );
+        }
+
+        // Verify it exists
+        {
+            let tree = fs.tree.read().unwrap();
+            assert!(tree.lookup(1, "failed.bin").is_some());
+        }
+
+        // Run cleanup
+        fs.cleanup_failed_write(&buf);
+
+        // Verify it's gone
+        {
+            let tree = fs.tree.read().unwrap();
+            assert!(tree.lookup(1, "failed.bin").is_none());
+        }
+    }
+
+    // ============== S33: new_rw sets all RW fields correctly ==============
+
+    #[test]
+    fn s33_new_rw_sets_rw_fields() {
+        let (_rt, fs) = make_rw_fs();
+        assert!(!fs.read_only);
+        assert!(fs.keys.is_some(), "keys should be set in RW mode");
+        assert!(
+            fs.server_url.is_some(),
+            "server_url should be set in RW mode"
+        );
+        assert!(
+            fs.runtime_handle.is_some(),
+            "runtime_handle should be set in RW mode"
+        );
+        assert!(
+            fs.cache_base.is_some(),
+            "cache_base should be set in RW mode"
+        );
     }
 }
