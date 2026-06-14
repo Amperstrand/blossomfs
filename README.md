@@ -1,8 +1,8 @@
-# BlossomFS -- Read-Only FUSE Filesystem for Blossom/Nostr Media
+# BlossomFS -- FUSE Filesystem for Blossom/Nostr Media
 
 ## What is BlossomFS?
 
-BlossomFS is a Linux userspace filesystem that makes Blossom blob storage available as local files. Mount a Blossom server (or a local manifest) and browse, read, and verify blobs through your regular filesystem tools. No special client libraries, no REST calls, no JSON parsing. Just `cat`, `ls`, `find`, and everything else that works on files.
+BlossomFS is a Linux userspace filesystem that makes Blossom blob storage available as local files. Mount a Blossom server (or a local manifest) and browse, read, upload, and verify blobs through your regular filesystem tools. No special client libraries, no REST calls, no JSON parsing. Just `cat`, `ls`, `find`, `cp`, and everything else that works on files.
 
 Blossom is a media storage layer built on top of Nostr. Blobs are identified by their SHA-256 hash and served over HTTPS. BlossomFS projects that storage into a directory tree so you can interact with it using standard Unix tooling.
 
@@ -10,7 +10,7 @@ Blossom is a media storage layer built on top of Nostr. Blobs are identified by 
 
 **M0 -- Research and design.** Validated all Blossom BUD specs, Nostr NIPs, and FUSE library APIs against primary sources. Design documents in `docs/`.
 
-**M1 -- Read-only mount.** Mount a Blossom server or manifest as a local directory. The filesystem rejects all write operations. Files appear as they would on the remote server.
+**M1 -- Read-only mount.** Mount a Blossom server or manifest as a local directory. Files appear as they would on the remote server.
 
 **M2 -- BUD-12 listing.** When the server supports the `/list` endpoint (BUD-12), BlossomFS fetches the full blob index at mount time and presents every listed blob as a file.
 
@@ -24,22 +24,84 @@ Blossom is a media storage layer built on top of Nostr. Blobs are identified by 
 
 **M7 -- Append-only drive design.** A design document for a future append-only drive namespace (replacing the deprecated single-replaceable-event model) is in `docs/append-only-drive-spec-draft.md`.
 
+**Read-write mode.** Upload blobs to a Blossom server through the filesystem. Write files to the mount point, and BlossomFS uploads them on close via BUD-02 with BUD-11 authentication. The `X-SHA-256` header is sent on every upload for server-side deduplication. Full POSIX open flag support, including `O_TRUNC` and `O_APPEND`.
+
+**Configurable TTL.** The `--ttl-secs` flag controls the FUSE entry and attribute cache TTL. Defaults to 31536000 (1 year). A long default is safe because Blossom blobs are content-addressed and immutable. Use a lower value for debugging.
+
+**CI.** GitHub Actions integration test suite with 5 scenarios covering Blossom server interaction, Cashu payment flows, and FUSE mount verification.
+
 ## What doesn't work yet
 
-- No writes, uploads, or deletes
-- No rename or move operations
-- No Nostr event signing or publishing
-- No BUD-11 authenticated operations (auth tokens)
+- No rename or link operations (returns ENOSYS in RW mode)
+- No delete operations via Blossom protocol (BUD-08 delete auth exists but is not wired)
+- Write buffers are in-memory and unbounded, designed for files under 100 MB
+- No eviction policy for the local cache
 - Append-only drive namespace (M7) is designed but not implemented
+
+## Read-Write Mode
+
+BlossomFS supports writing files to a Blossom server through the FUSE mount. When you write a file and close it, BlossomFS computes the SHA-256 hash, signs a BUD-11 auth event (kind 24242) with your private key, and uploads the blob via BUD-02 with the `X-SHA-256` header for server-side deduplication.
+
+### Requirements
+
+RW mode requires three things:
+
+1. `--read-only=false` to enable writes
+2. `--nsec-file <path>` (or `--dangerous-nsec-arg` for testing) to provide signing credentials
+3. At least one `--server` URL as the upload target
+
+### How it works
+
+- Writes are buffered in memory for the lifetime of the open file handle
+- On `close` (or `flush`), the buffer is uploaded to the Blossom server
+- `O_TRUNC` truncates the in-memory buffer at open time
+- `O_APPEND` sets the write offset to the end of the buffer
+- After a successful upload, the blob appears in the filesystem under its SHA-256 hash
+
+### Example: Upload a file
+
+```bash
+mkdir -p /tmp/blossomfs-mount
+
+blossomfs mount \
+  --mountpoint /tmp/blossomfs-mount \
+  --server https://blossom.example.com \
+  --nsec-file /path/to/nsec.txt \
+  --read-only=false
+```
+
+In another terminal, copy a file into the mount:
+
+```bash
+cp photo.jpg /tmp/blossomfs-mount/public/<pubkey>/servers/blossom.example.com/by-sha256/
+```
+
+When the `cp` command closes the file, BlossomFS uploads it. The file appears under its SHA-256 hash once the upload completes.
+
+### Example: Write a new blob directly
+
+```bash
+echo "hello blossom" > /tmp/blossomfs-mount/public/<pubkey>/servers/blossom.example.com/by-sha256/newfile.txt
+```
+
+BlossomFS uploads the content on close and the file is renamed to its SHA-256 hash.
+
+### About the nsec file
+
+The `--nsec-file` flag reads a Bech32-encoded `nsec1...` private key from the first line of the given file. The key is used only for signing BUD-11 auth events during uploads. It is never sent to the server.
+
+For testing, `--dangerous-nsec-arg nsec1...` accepts the key directly on the command line. This exposes the key in shell history and process listings. Do not use it outside of a test environment.
 
 ## Blossom Server Compatibility
 
-BlossomFS relies on two Blossom server endpoints:
+BlossomFS relies on several Blossom server endpoints:
 
-| Endpoint | BUD | Required? | Purpose |
-|---|---|---|---|
-| `GET /<sha256>` | BUD-01 | **Yes** | Download blob content by hash |
-| `GET /list/<pubkey>` | BUD-12 | For auto-discovery | Enumerate blobs owned by a pubkey |
+| Endpoint | BUD | Purpose |
+|---|---|---|
+| `GET /<sha256>` | BUD-01 | Download blob content by hash |
+| `PUT /upload` | BUD-02 | Upload blob content (RW mode) |
+| `GET /list/<pubkey>` | BUD-12 | Enumerate blobs owned by a pubkey |
+| `DELETE /<sha256>` | BUD-08 | Delete blob (not yet implemented) |
 
 ### BUD-12 listing: needed but privacy-sensitive
 
@@ -54,11 +116,11 @@ The intended discovery path is via Nostr events: NIP-94 file metadata events (ki
 
 ### Known server compatibility
 
-| Server | BUD-01 GET | BUD-12 List | BUD-02 Descriptor | Notes |
+| Server | BUD-01 GET | BUD-02 PUT | BUD-12 List | Notes |
 |---|---|---|---|---|
-| **blossom.psbt.me** | Yes | Yes (enabled) | No (404) | Tested with integration suite. Pagination works with sha256 cursor. |
-| **hzrd149/blossom-server** | Yes | Disabled by default | Yes | Set `list.enabled: true` in server config. |
-| **v0l/route96** | Yes | No | Unknown | Lightning payments required for some blobs. |
+| **blossom.psbt.me** | Yes | Yes | Yes | Tested in CI. Cashu payments for blobs over 1 MB. |
+| **hzrd149/blossom-server** | Yes | Yes | Disabled by default | Set `list.enabled: true` in server config. |
+| **v0l/route96** | Yes | Unknown | No | Lightning payments required for some blobs. |
 
 ### Enabling BUD-12 listing on your server
 
@@ -78,10 +140,6 @@ If the server returns 404 or 403 for `/list/<pubkey>`, BlossomFS still mounts su
 - Use `--manifest` to provide blob descriptors directly
 - Use `--relay` to discover blobs via Nostr events
 - Access blobs by hash if you construct paths manually
-
-## Why read-only first?
-
-Read-only is the safe starting point. There is no risk of accidental data loss, no conflict resolution to worry about, and the implementation surface is smaller. The goal is to get the core projection right, the hash-first view of blob storage working correctly, before adding mutation. Once reads are solid and well-tested, writes become a natural extension.
 
 ## Why filenames are not canonical in Blossom
 
@@ -146,6 +204,27 @@ Each server's blobs appear under `public/<pubkey>/servers/<hostname>/`. An aggre
 
 When both `--manifest` and `--server` are provided, both subtrees coexist under `/public/`.
 
+## CLI Reference
+
+```
+blossomfs mount [OPTIONS]
+
+OPTIONS:
+  --mountpoint <PATH>        FUSE mount point (required)
+  --npub <NPUB>              Bech32 public key (npub1...)
+  --pubkey <HEX>             Hex public key (64 hex chars)
+  --server <URL>             Blossom server URL (repeatable)
+  --manifest <PATH>          Path to manifest JSON file
+  --cache-dir <PATH>         Cache directory (default: /tmp/blossomfs)
+  --read-only <BOOL>         Mount read-only or RW (default: true)
+  --nsec-file <PATH>         File containing nsec for authenticated operations
+  --dangerous-nsec-arg <NSEC> Raw nsec on CLI (testing only; leaks to shell history)
+  --relay <URL>              Nostr relay URL for server discovery (repeatable)
+  --ttl-secs <SECONDS>       FUSE cache TTL (default: 31536000 = 1 year)
+```
+
+At least one of `--npub`, `--pubkey`, `--server`, or `--manifest` must be provided. In RW mode, `--nsec-file` (or `--dangerous-nsec-arg`) and at least one `--server` are required.
+
 ## Install dependencies
 
 BlossomFS targets Ubuntu 24.04 with FUSE3. Install the required system packages:
@@ -163,13 +242,13 @@ cargo build --release
 
 The binary will be at `./target/release/blossomfs`.
 
-## Demo: Manifest mode
+## Demo: Manifest mode (read-only)
 
 Manifest mode lets you mount blobs from a local JSON file without connecting to a server. An example manifest with four sample descriptors is included at `examples/manifest.json`.
 
 ```bash
 mkdir -p /tmp/blossomfs-mount
-./target/release/blossomfs mount --manifest examples/manifest.json --mountpoint /tmp/blossomfs-mount --read-only
+./target/release/blossomfs mount --manifest examples/manifest.json --mountpoint /tmp/blossomfs-mount
 ```
 
 In another terminal, browse the mounted filesystem:
@@ -179,15 +258,39 @@ find /tmp/blossomfs-mount -maxdepth 5 -type f -print
 cat /tmp/blossomfs-mount/README.txt
 ```
 
-## Demo: Real Blossom server
+## Demo: Real Blossom server (read-only)
 
 To mount a live Blossom server, provide an `npub` key and server URL:
 
 ```bash
-./target/release/blossomfs mount --npub npub1... --server https://blossom.example.com --mountpoint /tmp/blossomfs-mount --read-only
+./target/release/blossomfs mount \
+  --npub npub1... \
+  --server https://blossom.example.com \
+  --mountpoint /tmp/blossomfs-mount
 ```
 
-Replace `npub1...` with your actual public key and `https://blossom.example.com` with your server's address. The server must support Blossom's blob endpoints for this to work.
+Replace `npub1...` with your actual public key and `https://blossom.example.com` with your server's address. The `--read-only` flag defaults to `true`, so the mount is read-only without specifying it.
+
+## Demo: Read-write mode
+
+Upload blobs to a Blossom server through the filesystem:
+
+```bash
+./target/release/blossomfs mount \
+  --npub npub1... \
+  --server https://blossom.example.com \
+  --nsec-file /path/to/nsec.txt \
+  --read-only=false \
+  --mountpoint /tmp/blossomfs-mount
+```
+
+Then write files into the mount. They upload on close:
+
+```bash
+cp photo.jpg /tmp/blossomfs-mount/public/npub1.../servers/blossom.example.com/by-sha256/
+```
+
+Check `STATUS.txt` for upload results.
 
 ## Unmount
 
@@ -226,6 +329,8 @@ Then log out and back in (or start a new shell session) for the group change to 
 **Empty mount.** If no blob descriptors are found (empty manifest, server returned no listings), the mount still succeeds but the directory will contain only `STATUS.txt`. This is not an error; it means there is simply nothing to show.
 
 **Hash verification failed.** A downloaded blob did not match its expected SHA-256 hash. This usually means a corrupted download or a man-in-the-middle attack. Clear the local cache directory and try again. If the error persists, the server may be serving incorrect content.
+
+**Upload failed.** Check `STATUS.txt` for error details. Common causes: the server does not support BUD-02 upload, the nsec key does not match the npub, or the server requires payment for blobs over its free tier limit.
 
 ## License
 

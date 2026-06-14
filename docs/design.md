@@ -1,6 +1,6 @@
 # BlossomFS Design Document
 
-Read-only FUSE filesystem that mounts Blossom protocol media as a local directory tree.
+FUSE filesystem that mounts Blossom protocol media as a local directory tree. Supports both read-only and read-write modes.
 
 ---
 
@@ -78,7 +78,14 @@ let runtime = tokio::runtime::Runtime::new()
     .expect("Failed to create tokio runtime");
 let handle = runtime.handle().clone();
 
-let blossomfs = BlossomFS::new(config, handle);
+let blossomfs = BlossomFS::new_rw(
+    tree,
+    cache_dir,
+    handle,
+    keys,
+    server_url,
+    Duration::from_secs(args.ttl_secs),
+);
 fuser::mount2(blossomfs, &mountpoint, options)?;
 ```
 
@@ -181,45 +188,41 @@ Two maps provide O(1) lookup in both directions:
 
 ### Immutability
 
-The tree is built once at mount time and is immutable during the session. New inodes are never allocated after construction. This avoids lock contention during read operations.
-
-The tree is stored as `Arc<Tree>` (shared, immutable reference). No Mutex needed.
+In read-only mode, the tree is built once at mount time and is not mutated during the session. In read-write mode, the tree is mutable via `Arc<RwLock<Tree>>`, allowing directory mutations (mkdir, create, unlink) and node updates after successful blob uploads. New inodes are allocated on demand via an `AtomicU64` counter.
 
 ---
 
 ## Interior Mutability
 
-BlossomFS separates state into two categories:
+BlossomFS separates state into two categories. fuser 0.17.0 callbacks take `&self`, so all mutable state requires interior mutability via locks.
 
-### Immutable State: `Arc<Tree>`
-
-The directory tree, inode maps, and blob descriptors. Built once, read-only for the rest of the mount. No synchronization needed beyond `Arc` reference counting.
-
-### Mutable State: `Arc<Mutex<CacheState>>`
-
-The content cache needs interior mutability because:
-1. FUSE callbacks take `&self` (fuser 0.17.0 constraint).
-2. Blobs are fetched lazily on first read (not pre-fetched at mount time).
-3. Multiple FUSE read callbacks may race to fetch the same blob.
+### Struct Layout
 
 ```text
 struct BlossomFS {
-    tree: Arc<Tree>,                    // immutable
-    cache: Arc<Mutex<CacheState>>,       // mutable (interior)
-    client: BlossomClient,              // internally async
-    runtime: tokio::runtime::Handle,     // for block_on bridge
+    tree: Arc<RwLock<Tree>>,                    // mutable (directory mutations)
+    write_state: Arc<Mutex<HashMap<u64, WriteBuffer>>>,  // pending writes
+    cache_base: Option<PathBuf>,                 // blob cache root
+    runtime_handle: Option<Handle>,              // async runtime for network I/O
+    keys: Option<Keys>,                          // nsec for BUD-11 auth signing
+    server_url: Option<String>,                  // Blossom server for uploads
+    read_only: bool,                             // mount mode
+    next_fh: AtomicU64,                          // file handle allocator
+    ttl: Duration,                               // FUSE cache TTL
 }
 ```
 
-The Mutex is held only during cache lookup and update, not during the network fetch itself. A fetch-then-update pattern:
+### Tree: `Arc<RwLock<Tree>>`
 
-1. Lock cache, check if blob is present.
-2. If cache hit: unlock, return cached path.
-3. If cache miss: unlock, fetch blob to temp file, compute hash.
-4. Lock cache, move temp file to final path, mark as cached.
-5. Unlock, return path.
+The directory tree, inode maps, and blob descriptors. In read-only mode the lock is acquired for read only. In read-write mode, the write lock is taken for directory mutations (mkdir, create, unlink) and for updating tree nodes after successful blob uploads.
 
-This minimizes lock hold time and allows concurrent fetches of different blobs.
+### Write State: `Arc<Mutex<HashMap<u64, WriteBuffer>>>`
+
+In-memory write buffers for files being written. Each open file handle that was opened for writing gets a `WriteBuffer` keyed by file handle. The Mutex is held only during buffer lookup and update, not during network uploads.
+
+### Cache State
+
+The content cache (on-disk blob store) requires no in-process Mutex because it uses the filesystem itself for synchronization via atomic renames. Cache lookups and inserts are coordinated through file existence checks.
 
 ---
 
@@ -296,6 +299,55 @@ No automatic eviction in the initial implementation. The user manages cache size
 
 ---
 
+## Write Path (RW Mode)
+
+When mounted in read-write mode, BlossomFS supports creating and uploading new blobs through the standard FUSE write callbacks.
+
+### WriteBuffer
+
+Each open file handle that was opened for writing gets an in-memory `WriteBuffer`:
+
+```text
+struct WriteBuffer {
+    ino: u64,           // file inode
+    parent: u64,        // parent directory inode
+    name: String,       // filename
+    data: Vec<u8>,      // accumulated write data
+    flushed: bool,      // whether data has been uploaded
+    append: bool,       // O_APPEND mode
+}
+```
+
+The buffer is keyed by file handle in `Arc<Mutex<HashMap<u64, WriteBuffer>>>`.
+
+### Write Flow
+
+1. **create()**: Allocates a new inode, file handle, and empty `WriteBuffer`. A new tree node is inserted as `Static(empty)`. If the target file already exists and the open flags include `O_TRUNC`, the existing node is replaced.
+
+2. **write()**: Extends the buffer `data` at the given offset. If `O_APPEND` is set, data is appended to the end. The buffer grows in memory until flush.
+
+3. **flush()**: Triggers the upload. Fires a BUD-02 PUT request to the Blossom server with `X-SHA-256` and `Authorization` (BUD-11) headers. On success, the tree node is updated from `Static(empty)` to `Remote(sha256, url)`. Sets the `flushed` flag to prevent re-upload (flush can fire multiple times due to fork/dup).
+
+4. **release()**: Removes the `WriteBuffer` from the map. If `flushed` is false (flush never fired or failed), a fallback upload is attempted. If the upload ultimately fails, the file is removed from the tree via `cleanup_failed_write()`.
+
+### BUD-11 Auth Flow
+
+Before uploading, a kind 24242 Nostr event is signed with the user's nsec. The event contains:
+
+- Expiration timestamp
+- Upload action
+- SHA-256 hash of the data
+- Server URL
+
+The event is base64-encoded and sent as an `Authorization: Nostr <event>` header alongside the BUD-02 PUT request. This proves to the server that the uploader controls the associated pubkey.
+
+### O_TRUNC and O_APPEND
+
+- `O_TRUNC` on an existing file during create() replaces the tree node and resets the write buffer.
+- `O_APPEND` causes write() to always append to the buffer rather than writing at the provided offset.
+
+---
+
 ## Nostr Layer
 
 ### Key Parsing (`keys.rs`)
@@ -356,21 +408,22 @@ Every blob is verified against its expected SHA-256 hash after download. If the 
 
 ### Content-Type Trust
 
-MIME types from remote servers are used only for file extensions and directory names, never for programmatic decisions like executing files. The FUSE filesystem is read-only.
+MIME types from remote servers are used only for file extensions and directory names, never for programmatic decisions like executing files.
 
 ### Secret Key Hygiene
 
 Private keys (`nsec`) are held in memory for signing auth events but are never included in log output. The tracing subscriber filters or the auth module explicitly redacts key material before formatting.
 
-### Read-Only Enforcement
+### Read-Write Enforcement
 
-All write-related FUSE callbacks (create, write, unlink, rename, etc.) return `EROFS` (Read-only file system). The filesystem cannot be modified through the FUSE interface, even by root.
+In read-only mode, all write-related callbacks return `EROFS` (Read-only file system). In RW mode, `create`, `write`, `mkdir`, and `unlink` are supported. `rename` and `link` return `ENOSYS` (function not implemented).
 
 ### Network Security
 
 - HTTP traffic to Blossom servers is over HTTPS where available.
 - Auth tokens (kind 24242 events) are scoped to specific actions and optionally to specific servers or blob hashes.
 - No credentials are persisted to disk.
+- Uploads include an `X-SHA-256` header per BUD-02, enabling server-side deduplication and integrity checking.
 
 ---
 
@@ -407,3 +460,11 @@ Kind 1063 event parsing. Populate `by-type/` views from NIP-94 metadata. Fallbac
 ### M7: Auth and Hardening
 
 Kind 24242 auth event signing. Authenticated listing and retrieval for private blobs. Error handling polish. Rate limit awareness. Comprehensive logging. Integration tests with wiremock.
+
+### M8: Read-Write Mode (done)
+
+BUD-02 blob upload with BUD-11 auth event signing. FUSE write callbacks (create, write, flush, release) with in-memory WriteBuffer. `X-SHA-256` header for server-side dedup. `O_TRUNC` and `O_APPEND` support. Configurable FUSE cache TTL (`--ttl-secs` flag). `getxattr` callback for `security.capability` noise reduction.
+
+### M9: RW Mode Improvements (done)
+
+TTL: const 1s to configurable struct field (default 1 year for immutable content). `open()` fh allocation for writable opens of existing Static files. `rename`/`link` return `ENOSYS` (not `EROFS`) in RW mode. `O_TRUNC` handling in `create()` for existing files.

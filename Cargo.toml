@@ -2,7 +2,7 @@
 name = "blossomfs"
 version = "0.1.0"
 edition = "2024"
-description = "Read-only FUSE filesystem for Blossom/Nostr media"
+description = "FUSE filesystem for Blossom/Nostr blob storage with read-write support"
 license = "MIT"
 repository = "https://github.com/Amperstrand/blossomfs"
 keywords = ["fuse", "blossom", "nostr", "filesystem", "storage"]

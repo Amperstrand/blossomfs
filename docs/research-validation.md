@@ -8,22 +8,27 @@ All NIP specs come from [nostr-protocol/nips](https://github.com/nostr-protocol/
 
 ## Crate Versions
 
+Dependencies actually used in `Cargo.toml` as of the latest commit:
+
 | Crate | Version | Role |
 |---|---|---|
 | `fuser` | 0.17 | FUSE3 filesystem (Linux) |
 | `nostr-sdk` | 0.45.0-alpha.1 | Nostr relay client, key parsing, event signing |
-| `nostr-blossom` | 0.45.0-alpha.1 | Blossom type definitions and basic client ops |
-| `reqwest` | 0.13 (stream feature) | HTTP client for cursor pagination and streaming blob fetch |
+| `reqwest` | 0.13 (stream feature) | HTTP client for BUD-02 upload, BUD-12 pagination, streaming blob fetch |
 | `tokio` | 1 (full) | Async runtime |
 | `clap` | 4 (derive) | CLI argument parsing |
 | `serde` / `serde_json` | 1 | Serialization |
-| `sha2` | 0.10 | SHA-256 hashing for blob verification |
-| `anyhow` / `thiserror` | 1 / 2 | Error handling |
+| `sha2` | 0.10 | SHA-256 hashing for blob verification and upload integrity |
+| `hex` | 0.4 | Hex encoding/decoding |
+| `base64` | 0.22 | Base64 encoding for BUD-11 auth headers |
+| `thiserror` | 2 | Error handling |
 | `tracing` | 0.1 | Structured logging |
-| `directories` | 5 | Platform cache directory resolution |
+| `tracing-subscriber` | 0.3 (env-filter) | Log filtering |
 | `mime_guess` | 2 | MIME-to-extension inference |
 | `wiremock` | 0.6 | HTTP mock server (dev-dep) |
 | `tempfile` | 3 | Temporary directories (dev-dep) |
+
+> **Note**: The project originally planned to use `nostr-blossom` and `directories` crates but ultimately replaced them with raw `nostr-sdk` + `reqwest` for more control, and a hardcoded `/tmp/blossomfs` cache default overridable via `--cache-dir`.
 
 ---
 
