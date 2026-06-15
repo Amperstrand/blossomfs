@@ -137,6 +137,7 @@ pub fn build_tollgate_tree(tree: &mut Tree, releases: &[TollgateRelease]) -> usi
             release.size,
             release.mime_type.clone(),
             0,
+            None,
         );
         count += 1;
     }

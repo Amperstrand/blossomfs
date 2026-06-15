@@ -31,6 +31,8 @@ pub struct BlobDescriptor {
     #[serde(rename = "type")]
     pub mime_type: Option<String>,
     pub uploaded: u64,
+    #[serde(default)]
+    pub expiration: Option<u64>,
 }
 
 impl BlobDescriptor {
@@ -187,6 +189,7 @@ mod tests {
             size: 200,
             mime_type: Some("application/json".to_string()),
             uploaded: 1700000500,
+            expiration: None,
         };
 
         let json = serde_json::to_string(&original).expect("Should serialize");
@@ -208,6 +211,7 @@ mod tests {
             size: 100,
             mime_type: Some("image/png".to_string()),
             uploaded: 1700000000,
+            expiration: None,
         };
 
         assert_eq!(desc.effective_mime_type(), "image/png");
@@ -222,6 +226,7 @@ mod tests {
             size: 100,
             mime_type: None,
             uploaded: 1700000000,
+            expiration: None,
         };
 
         assert_eq!(desc.effective_mime_type(), "application/octet-stream");
@@ -236,6 +241,7 @@ mod tests {
             size: 100,
             mime_type: Some("image/png".to_string()),
             uploaded: 1700000000,
+            expiration: None,
         };
 
         assert_eq!(desc.sha256_lower(), "abc123def456");
@@ -249,6 +255,7 @@ mod tests {
             size: 100,
             mime_type: None,
             uploaded: 1,
+            expiration: None,
         };
         assert!(desc.validate().is_ok());
     }
@@ -261,6 +268,7 @@ mod tests {
             size: 100,
             mime_type: None,
             uploaded: 1,
+            expiration: None,
         };
         assert!(desc.validate().is_ok());
     }
@@ -273,6 +281,7 @@ mod tests {
             size: 100,
             mime_type: None,
             uploaded: 1,
+            expiration: None,
         };
         assert!(matches!(
             desc.validate(),
@@ -288,6 +297,7 @@ mod tests {
             size: 100,
             mime_type: None,
             uploaded: 1,
+            expiration: None,
         };
         assert!(matches!(
             desc.validate(),
@@ -303,6 +313,7 @@ mod tests {
             size: MAX_BLOB_SIZE,
             mime_type: None,
             uploaded: 1,
+            expiration: None,
         };
         assert!(desc.validate().is_ok());
     }
@@ -315,6 +326,7 @@ mod tests {
             size: MAX_BLOB_SIZE + 1,
             mime_type: None,
             uploaded: 1,
+            expiration: None,
         };
         assert!(matches!(
             desc.validate(),

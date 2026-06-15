@@ -257,6 +257,7 @@ impl Tree {
         size: u64,
         mime_type: Option<String>,
         uploaded: u64,
+        expiration: Option<u64>,
     ) -> u64 {
         let sanitized = sanitize_path_component(name);
         let ino = self.next_inode();
@@ -269,7 +270,7 @@ impl Tree {
                 url,
                 sha256,
                 mime_type,
-                expires: None,
+                expires: expiration,
             },
             uploaded,
         });
@@ -372,6 +373,7 @@ impl Tree {
                     desc.size,
                     desc.mime_type.clone(),
                     desc.uploaded,
+                    desc.expiration,
                 );
             }
 
@@ -387,6 +389,7 @@ impl Tree {
                 desc.size,
                 desc.mime_type.clone(),
                 desc.uploaded,
+                desc.expiration,
             );
 
             // by-date — group under YYYY/MM/DD.
@@ -402,6 +405,7 @@ impl Tree {
                 desc.size,
                 desc.mime_type.clone(),
                 desc.uploaded,
+                desc.expiration,
             );
         }
     }
@@ -437,6 +441,7 @@ impl Tree {
                     desc.size,
                     desc.mime_type.clone(),
                     desc.uploaded,
+                    desc.expiration,
                 );
             }
         }
@@ -627,6 +632,7 @@ mod tests {
             size: 100,
             mime_type: mime.map(|s| s.to_string()),
             uploaded,
+            expiration: None,
         }
     }
 
@@ -695,6 +701,7 @@ mod tests {
             100,
             Some("image/png".to_string()),
             1700000000,
+            None,
         );
         assert_eq!(tree.lookup(1, "abc.png"), Some(ino));
         match tree.get(ino).unwrap() {
@@ -1116,6 +1123,7 @@ mod tests {
             42,
             Some("image/png".to_string()),
             1700000123,
+            None,
         );
 
         assert_eq!(tree.uploaded(file_ino), Some(1700000123));
@@ -1139,6 +1147,7 @@ mod tests {
             42,
             Some("image/png".to_string()),
             1700000000,
+            None,
         );
 
         assert_eq!(
@@ -1191,6 +1200,7 @@ mod tests {
             42,
             Some("image/png".to_string()),
             now - 86400,
+            None,
         );
         tree.set_expires(ino, Some(now + 3 * 86400));
 
@@ -1215,6 +1225,7 @@ mod tests {
             42,
             Some("image/png".to_string()),
             now,
+            None,
         );
         tree.set_expires(ino, Some(now + 30 * 86400));
 
@@ -1240,6 +1251,7 @@ mod tests {
             42,
             Some("image/png".to_string()),
             now,
+            None,
         );
 
         let result = tree.collect_expiring_blobs(now, 7 * 86400);
@@ -1290,6 +1302,7 @@ mod tests {
             42,
             Some("image/png".to_string()),
             now,
+            None,
         );
         tree.set_expires(ino, Some(now + 2 * 86400));
 

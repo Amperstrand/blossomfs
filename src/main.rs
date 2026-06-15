@@ -101,6 +101,7 @@ fn add_drive_file(
             size,
             mime.map(|s| s.to_string()),
             0,
+            None,
         );
         true
     } else {
@@ -349,6 +350,7 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
                                 meta.size.unwrap_or(0),
                                 meta.mime_type.clone(),
                                 0,
+                                None,
                             );
                             blob_count += 1;
                         }

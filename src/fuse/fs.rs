@@ -1342,6 +1342,7 @@ mod tests {
             42,
             Some("application/octet-stream".to_string()),
             1700000000,
+            None,
         );
         BlossomFS::new(tree, Duration::from_secs(1))
     }
@@ -1579,6 +1580,7 @@ mod tests {
             size,
             Some("application/octet-stream".to_string()),
             1700000000,
+            None,
         );
         tree
     }
@@ -2342,6 +2344,7 @@ mod tests {
                 100,
                 None,
                 1700000000,
+                None,
             )
         };
         {
@@ -2365,6 +2368,7 @@ mod tests {
                 500_000,
                 None,
                 uploaded,
+                None,
             )
         };
         let expected = uploaded + 30 * 86400;
@@ -2384,6 +2388,7 @@ mod tests {
                 2_000_000,
                 None,
                 1700000000,
+                None,
             )
         };
         assert_eq!(fs.compute_effective_expiry(ino), None);
@@ -2429,6 +2434,7 @@ mod tests {
                 500_000,
                 None,
                 uploaded,
+                None,
             )
         };
         {
