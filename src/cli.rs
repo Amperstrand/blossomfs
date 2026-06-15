@@ -299,6 +299,12 @@ pub struct MountArgs {
 
     #[arg(long, default_value_t = 100)]
     pub max_write_mb: u64,
+
+    #[arg(long, default_value_t = 30)]
+    pub free_period_days: u64,
+
+    #[arg(long, default_value_t = 1)]
+    pub max_free_size_mb: u64,
 }
 
 impl Default for MountArgs {
@@ -316,6 +322,8 @@ impl Default for MountArgs {
             relay: Vec::new(),
             ttl_secs: 31536000,
             max_write_mb: 100,
+            free_period_days: 30,
+            max_free_size_mb: 1,
         }
     }
 }

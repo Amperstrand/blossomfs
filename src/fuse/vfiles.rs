@@ -11,16 +11,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Information used to generate virtual file content.
 pub struct MountInfo {
-    /// The mountpoint path
     pub mountpoint: String,
-    /// The npub (bech32) being served, or "all" for multi-pubkey
     pub npub: String,
-    /// Number of blossom servers configured
     pub server_count: usize,
-    /// Total blob count across all servers
     pub blob_count: usize,
-    /// Cache directory path
     pub cache_dir: String,
+    pub expiring_soon: Vec<(String, u64)>,
 }
 
 /// Generate README.txt content.
@@ -64,13 +60,12 @@ You are currently browsing the Blossom content for pubkey: {}
 /// Contains live status information: server count, blob count,
 /// npub being served, cache directory path, and a timestamp.
 pub fn generate_status(info: &MountInfo) -> Vec<u8> {
-    // Get current timestamp
     let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_secs(),
         Err(_) => 0,
     };
 
-    let content = format!(
+    let mut content = format!(
         "BlossomFS Status
 ===============
 
@@ -79,11 +74,27 @@ Total blobs: {}
 Pubkey: {}
 Cache directory: {}
 Last updated: {}
-
-Note: This file is regenerated on each read
 ",
         info.server_count, info.blob_count, info.npub, info.cache_dir, now
     );
+
+    if !info.expiring_soon.is_empty() {
+        content.push_str("\nExpiring Soon (within 7 days)\n");
+        content.push_str("-----------------------------\n");
+        for (name, expiry) in &info.expiring_soon {
+            let days_left = if *expiry > now {
+                (*expiry - now) / 86400
+            } else {
+                0
+            };
+            content.push_str(&format!(
+                "  {} — expires in {} day(s) (ts={})\n",
+                name, days_left, expiry
+            ));
+        }
+    }
+
+    content.push_str("\nNote: This file is regenerated on each read\n");
 
     content.into_bytes()
 }
@@ -99,6 +110,7 @@ mod tests {
             server_count: 3,
             blob_count: 42,
             cache_dir: "/tmp/blossomfs_cache".to_string(),
+            expiring_soon: Vec::new(),
         }
     }
 
@@ -228,14 +240,16 @@ mod tests {
             server_count: 3,
             blob_count: 42,
             cache_dir: "/tmp/blossomfs_cache".to_string(),
+            expiring_soon: Vec::new(),
         };
 
         let info2 = MountInfo {
             mountpoint: "/mnt/blossomfs".to_string(),
             npub: "npub1testnpub123456789".to_string(),
             server_count: 3,
-            blob_count: 99, // Different blob count
+            blob_count: 99,
             cache_dir: "/tmp/blossomfs_cache".to_string(),
+            expiring_soon: Vec::new(),
         };
 
         let content1 = generate_status(&info1);
@@ -257,6 +271,7 @@ mod tests {
             server_count: 0,
             blob_count: 42,
             cache_dir: "/tmp/blossomfs_cache".to_string(),
+            expiring_soon: Vec::new(),
         };
 
         let content = generate_readme(&info);
@@ -278,6 +293,7 @@ mod tests {
             server_count: 3,
             blob_count: 0,
             cache_dir: "/tmp/blossomfs_cache".to_string(),
+            expiring_soon: Vec::new(),
         };
 
         let content = generate_status(&info);

@@ -334,6 +334,7 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
         server_count,
         blob_count,
         cache_dir: args.cache_dir.display().to_string(),
+        expiring_soon: Vec::new(),
     };
 
     let readme_content = generate_readme(&mount_info);
@@ -394,6 +395,8 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
                     s,
                     Duration::from_secs(args.ttl_secs),
                     (args.max_write_mb as usize) * 1024 * 1024,
+                    args.free_period_days * 86400,
+                    (args.max_free_size_mb as usize) * 1024 * 1024,
                 ),
                 true,
             )
@@ -406,6 +409,8 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
                     args.cache_dir.clone(),
                     handle,
                     Duration::from_secs(args.ttl_secs),
+                    args.free_period_days * 86400,
+                    (args.max_free_size_mb as usize) * 1024 * 1024,
                 ),
                 false,
             )
