@@ -290,6 +290,14 @@ pub struct MountArgs {
     #[arg(long)]
     pub relay: Vec<String>,
 
+    /// NIP-34 relay for git repo browsing (repeatable)
+    #[arg(long)]
+    pub nip34_relay: Vec<String>,
+
+    /// NIP-34 pubkey whose repos to browse (hex or npub)
+    #[arg(long)]
+    pub nip34_pubkey: Option<String>,
+
     /// FUSE entry/attribute cache TTL in seconds.
     ///
     /// Since Blossom blobs are content-addressed (immutable), a long TTL is
@@ -320,6 +328,8 @@ impl Default for MountArgs {
             nsec_file: None,
             dangerous_nsec_arg: None,
             relay: Vec::new(),
+            nip34_relay: Vec::new(),
+            nip34_pubkey: None,
             ttl_secs: 31536000,
             max_write_mb: 100,
             free_period_days: 30,

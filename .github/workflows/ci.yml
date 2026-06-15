@@ -89,6 +89,11 @@ jobs:
           BLOSSOMFS_BIN: ./target/release/blossomfs
         run: bash scripts/ci_tollgate_test.sh
 
+      - name: Run NIP-34 integration test (ngit relay + git repo browser)
+        env:
+          BLOSSOMFS_BIN: ./target/release/blossomfs
+        run: bash scripts/ci_nip34_test.sh
+
       - name: Upload test artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -97,4 +102,5 @@ jobs:
           path: |
             /tmp/blossom-ci/
             /tmp/blossom-ci-tollgate/
+            /tmp/blossom-ci-nip34/
           retention-days: 7

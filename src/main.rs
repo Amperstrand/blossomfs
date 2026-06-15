@@ -28,6 +28,7 @@ use crate::fuse::vfiles::{MountInfo, generate_readme, generate_status};
 use crate::nostr::discovery::discover_servers;
 use crate::nostr::keys::{parse_npub, parse_nsec, read_nsec_file};
 use crate::nostr::legacy_drive::{DriveEntry, fetch_drive_events};
+use crate::nostr::nip34::fetch_nip34_events;
 use crate::nostr::nip94::fetch_nip94_events;
 use crate::util::path::sanitize_hostname;
 
@@ -375,6 +376,31 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
             Err(e) => {
                 tracing::warn!("NIP-94 fetch via relays failed: {}", e);
+            }
+        }
+    }
+
+    // --- NIP-34: /git/<pubkey>/<repo-id>/... (kind 30617 repos, 1617 patches, 1621 issues) ---
+    if !args.nip34_relay.is_empty()
+        && let Some(ref nip34_pk) = args.nip34_pubkey
+    {
+        let resolved_pk = if let Ok(pk) = parse_npub(nip34_pk) {
+            pk.to_hex()
+        } else {
+            nip34_pk.clone()
+        };
+        match rt.block_on(fetch_nip34_events(&args.nip34_relay, &resolved_pk)) {
+            Ok(data) => {
+                let count = crate::nostr::nip34::build_nip34_tree(&mut tree, &resolved_pk, &data);
+                blob_count += count;
+                tracing::info!(
+                    "NIP-34: built git browser tree ({} files, {} repos)",
+                    count,
+                    data.repos.len()
+                );
+            }
+            Err(e) => {
+                tracing::warn!("NIP-34 fetch failed: {}", e);
             }
         }
     }
