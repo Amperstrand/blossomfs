@@ -24,12 +24,20 @@ pub struct FileMeta {
     pub dim: Option<String>,
     pub blurhash: Option<String>,
     pub alt: Option<String>,
+    #[serde(default)]
+    pub filename: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Nip94Record {
+    pub meta: FileMeta,
+    pub raw_tags: Vec<Vec<String>>,
 }
 
 pub async fn fetch_nip94_events(
     relays: &[String],
     pubkey_hex: &str,
-) -> Result<Vec<FileMeta>, Nip94Error> {
+) -> Result<Vec<Nip94Record>, Nip94Error> {
     let public_key =
         PublicKey::from_hex(pubkey_hex).map_err(|e| Nip94Error::InvalidPubkey(e.to_string()))?;
 
@@ -39,16 +47,19 @@ pub async fn fetch_nip94_events(
     }
     client.connect().await;
 
-    let filter = Filter::new().kind(Kind::Custom(1063)).author(public_key);
+    let filter = Filter::new()
+        .kind(Kind::Custom(1063))
+        .author(public_key)
+        .limit(5000);
 
     let events = client
         .fetch_events(filter)
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(15))
         .await?;
 
     client.disconnect().await;
 
-    let metas: Vec<FileMeta> = events
+    let records: Vec<Nip94Record> = events
         .iter()
         .map(|event| {
             let raw_tags: Vec<Vec<&str>> = event
@@ -56,14 +67,21 @@ pub async fn fetch_nip94_events(
                 .iter()
                 .map(|t| t.as_slice().iter().map(|s| s.as_str()).collect())
                 .collect();
-            parse_nip94_from_tags(&raw_tags)
+            let raw_tags_owned: Vec<Vec<String>> = raw_tags
+                .iter()
+                .map(|t| t.iter().map(|s| s.to_string()).collect())
+                .collect();
+            Nip94Record {
+                meta: parse_nip94_from_tags(&raw_tags),
+                raw_tags: raw_tags_owned,
+            }
         })
         .collect();
 
-    if metas.is_empty() {
+    if records.is_empty() {
         Err(Nip94Error::NoEvents)
     } else {
-        Ok(metas)
+        Ok(records)
     }
 }
 
@@ -76,6 +94,7 @@ fn parse_nip94_from_tags(tags: &[Vec<&str>]) -> FileMeta {
         dim: None,
         blurhash: None,
         alt: None,
+        filename: None,
     };
 
     for tag in tags {
@@ -106,6 +125,9 @@ fn parse_nip94_from_tags(tags: &[Vec<&str>]) -> FileMeta {
             }
             "alt" => {
                 meta.alt = Some(tag[1].to_string());
+            }
+            "filename" => {
+                meta.filename = Some(tag[1].to_string());
             }
             _ => {}
         }
@@ -144,6 +166,25 @@ mod tests {
             Some("LEHV6nWB2yk8pyo0adR*.7kCMdnj")
         );
         assert_eq!(meta.alt.as_deref(), Some("A beautiful sunset"));
+        assert!(meta.filename.is_none(), "no filename tag in this test");
+    }
+
+    #[test]
+    fn test_parse_filename_tag() {
+        let tags = vec![
+            vec!["x", "abc123"],
+            vec!["url", "https://blossom.example.com/abc123.bin"],
+            vec!["filename", "tollgate-os-glinet_gl-mt3000-v0.4.0.bin"],
+            vec!["size", "14828394"],
+            vec!["m", "application/octet-stream"],
+        ];
+        let meta = parse_nip94_from_tags(&tags);
+        assert_eq!(
+            meta.filename.as_deref(),
+            Some("tollgate-os-glinet_gl-mt3000-v0.4.0.bin")
+        );
+        assert_eq!(meta.sha256.as_deref(), Some("abc123"));
+        assert_eq!(meta.size, Some(14828394));
     }
 
     #[test]

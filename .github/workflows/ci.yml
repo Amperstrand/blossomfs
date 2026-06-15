@@ -72,9 +72,9 @@ jobs:
       - name: Fund CI Cashu wallet (skip if balance sufficient)
         run: |
           balance=$(cashu -h https://testnut.cashu.space -w ci-test -u sat -y balance 2>/dev/null | head -1 | grep -oP '\d+' || echo "0")
-          if [ "$balance" -lt 50 ]; then
-            echo "Balance: ${balance} sat — minting 1000 sat..."
-            timeout 120 cashu -h https://testnut.cashu.space -w ci-test -u sat -y invoice 1000 || true
+          if [ "$balance" -lt 500 ]; then
+            echo "Balance: ${balance} sat — minting 5000 sat..."
+            timeout 90 cashu -h https://testnut.cashu.space -w ci-test -u sat -y invoice 5000 || true
           else
             echo "Balance: ${balance} sat — skipping funding"
           fi
@@ -84,10 +84,17 @@ jobs:
           BLOSSOMFS_BIN: ./target/release/blossomfs
         run: bash scripts/ci_test.sh
 
+      - name: Run tollgate integration test (NIP-94 relay + structured directory)
+        env:
+          BLOSSOMFS_BIN: ./target/release/blossomfs
+        run: bash scripts/ci_tollgate_test.sh
+
       - name: Upload test artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ci-test-output
-          path: /tmp/blossom-ci/
+          path: |
+            /tmp/blossom-ci/
+            /tmp/blossom-ci-tollgate/
           retention-days: 7

@@ -107,7 +107,10 @@ fn add_drive_file(
 }
 
 fn main() {
-    // Initialize tracing
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -298,25 +301,76 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // --- NIP-94 metadata: /metadata/<sha256>.json (kind 1063) ---
+    // --- NIP-94: /metadata/<sha256>.json + /nip94/<pubkey>/<filename> + /tollgate/ (kind 1063) ---
     if !args.relay.is_empty()
         && let Some(ref pk) = pubkey_hex
     {
         match rt.block_on(fetch_nip94_events(&args.relay, pk)) {
-            Ok(metas) => {
-                tracing::info!("fetched {} NIP-94 metadata events", metas.len());
+            Ok(records) => {
+                tracing::info!("fetched {} NIP-94 metadata events", records.len());
+
                 let meta_root = tree.add_directory(tree.root(), "metadata");
-                for meta in &metas {
-                    if let Some(ref sha) = meta.sha256 {
-                        if sha.len() == 64 && sha.chars().all(|c| c.is_ascii_hexdigit()) {
-                            let json = serde_json::to_string_pretty(meta)
-                                .unwrap_or_default()
-                                .into_bytes();
-                            tree.add_static_file(meta_root, &format!("{}.json", sha), json);
-                        } else {
-                            tracing::warn!("skipping NIP-94 metadata with invalid sha256: {}", sha);
+
+                let nip94_root = tree.add_directory(tree.root(), "nip94");
+                let pk_dir = tree.add_directory(nip94_root, pk);
+                let mut seen_filenames: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+
+                let mut tollgate_releases: Vec<crate::nostr::tollgate::TollgateRelease> =
+                    Vec::new();
+
+                for record in &records {
+                    let meta = &record.meta;
+                    if let Some(ref sha) = meta.sha256
+                        && sha.len() == 64
+                        && sha.chars().all(|c| c.is_ascii_hexdigit())
+                    {
+                        let json = serde_json::to_string_pretty(meta)
+                            .unwrap_or_default()
+                            .into_bytes();
+                        tree.add_static_file(meta_root, &format!("{}.json", sha), json);
+
+                        if let Some(ref url) = meta.url {
+                            let display_name = meta.filename.as_deref().unwrap_or(sha);
+                            let unique_name = if seen_filenames.contains(display_name) {
+                                format!("{}-{}", &sha[..12], display_name)
+                            } else {
+                                display_name.to_string()
+                            };
+                            seen_filenames.insert(display_name.to_string());
+
+                            tree.add_remote_file(
+                                pk_dir,
+                                &unique_name,
+                                url.clone(),
+                                sha.clone(),
+                                meta.size.unwrap_or(0),
+                                meta.mime_type.clone(),
+                                0,
+                            );
+                            blob_count += 1;
                         }
+
+                        let raw_tag_refs: Vec<Vec<&str>> = record
+                            .raw_tags
+                            .iter()
+                            .map(|t| t.iter().map(|s| s.as_str()).collect())
+                            .collect();
+                        if let Some(rel) =
+                            crate::nostr::tollgate::parse_tollgate_release(&raw_tag_refs)
+                        {
+                            tollgate_releases.push(rel);
+                        }
+                    } else if let Some(ref sha) = meta.sha256 {
+                        tracing::warn!("skipping NIP-94 metadata with invalid sha256: {}", sha);
                     }
+                }
+
+                if !tollgate_releases.is_empty() {
+                    let count =
+                        crate::nostr::tollgate::build_tollgate_tree(&mut tree, &tollgate_releases);
+                    blob_count += count;
+                    tracing::info!("built tollgate directory tree with {} releases", count);
                 }
             }
             Err(e) => {

@@ -11,3 +11,4 @@ pub mod discovery;
 pub mod keys;
 pub mod legacy_drive;
 pub mod nip94;
+pub mod tollgate;
