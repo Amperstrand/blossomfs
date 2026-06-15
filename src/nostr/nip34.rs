@@ -135,16 +135,14 @@ pub async fn fetch_nip34_events(
 
         match event.kind {
             Kind::Custom(1621) => {
-                if let Some(issue) =
-                    parse_issue_from_tags(&tags, &event.content, &id, &author, ct)
+                if let Some(issue) = parse_issue_from_tags(&tags, &event.content, &id, &author, ct)
                     && repo_addrs.contains(&issue.repo_ref)
                 {
                     issues.push(issue);
                 }
             }
             Kind::Custom(1617) => {
-                if let Some(patch) =
-                    parse_patch_from_tags(&tags, &event.content, &id, &author, ct)
+                if let Some(patch) = parse_patch_from_tags(&tags, &event.content, &id, &author, ct)
                     && repo_addrs.contains(&patch.repo_ref)
                 {
                     patches.push(patch);
