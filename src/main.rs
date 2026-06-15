@@ -9,6 +9,7 @@ mod blossom;
 mod cache;
 mod cli;
 mod fuse;
+mod git;
 mod nostr;
 mod util;
 
@@ -391,7 +392,13 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
         };
         match rt.block_on(fetch_nip34_events(&args.nip34_relay, &resolved_pk)) {
             Ok(data) => {
-                let count = crate::nostr::nip34::build_nip34_tree(&mut tree, &resolved_pk, &data);
+                let count = crate::nostr::nip34::build_nip34_tree(
+                    &mut tree,
+                    &resolved_pk,
+                    &data,
+                    args.nip34_clone,
+                    &args.cache_dir,
+                );
                 blob_count += count;
                 tracing::info!(
                     "NIP-34: built git browser tree ({} files, {} repos)",

@@ -298,6 +298,13 @@ pub struct MountArgs {
     #[arg(long)]
     pub nip34_pubkey: Option<String>,
 
+    /// [EXPERIMENTAL] Enable lazy git clone for NIP-34 repos.
+    /// When set, browsing into a repo directory triggers a shallow
+    /// `git clone --depth 1` on first access, then the full file tree
+    /// becomes browseable through FUSE.
+    #[arg(long, default_value_t = false)]
+    pub nip34_clone: bool,
+
     /// FUSE entry/attribute cache TTL in seconds.
     ///
     /// Since Blossom blobs are content-addressed (immutable), a long TTL is
@@ -330,6 +337,7 @@ impl Default for MountArgs {
             relay: Vec::new(),
             nip34_relay: Vec::new(),
             nip34_pubkey: None,
+            nip34_clone: false,
             ttl_secs: 31536000,
             max_write_mb: 100,
             free_period_days: 30,

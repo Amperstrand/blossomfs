@@ -22,6 +22,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::blossom::descriptor::BlobDescriptor;
@@ -47,6 +48,18 @@ pub enum FileContent {
         mime_type: Option<String>,
         expires: Option<u64>,
     },
+    /// Content served from a local file on disk (e.g. cloned git repo files).
+    Local { path: PathBuf },
+}
+
+/// Information needed to lazily populate a directory on first access.
+#[derive(Debug, Clone)]
+pub enum LazyDir {
+    /// Clone a git repository and populate the directory with its file tree.
+    GitRepo {
+        clone_url: String,
+        cache_path: PathBuf,
+    },
 }
 
 /// A node in the virtual filesystem tree.
@@ -57,6 +70,7 @@ pub enum TreeNode {
         name: String,
         children: Vec<u64>,
         parent: u64,
+        lazy: Option<LazyDir>,
     },
     File {
         ino: u64,
@@ -88,6 +102,7 @@ impl Tree {
                 name: String::from("/"),
                 children: Vec::new(),
                 parent: 0,
+                lazy: None,
             }],
             root: 1,
         }
@@ -200,6 +215,7 @@ impl Tree {
             name: sanitized,
             children: Vec::new(),
             parent,
+            lazy: None,
         });
         if let Some(TreeNode::Directory { children, .. }) = self.get_mut(parent) {
             children.push(ino);
@@ -269,6 +285,55 @@ impl Tree {
             return child_ino;
         }
         self.add_directory(parent, name)
+    }
+
+    /// Add a directory that will be lazily populated on first `readdir`.
+    pub fn add_lazy_dir(&mut self, parent: u64, name: &str, lazy: LazyDir) -> u64 {
+        let sanitized = sanitize_path_component(name);
+        let ino = self.next_inode();
+        self.nodes.push(TreeNode::Directory {
+            ino,
+            name: sanitized,
+            children: Vec::new(),
+            parent,
+            lazy: Some(lazy),
+        });
+        if let Some(TreeNode::Directory { children, .. }) = self.get_mut(parent) {
+            children.push(ino);
+        }
+        ino
+    }
+
+    /// Add a file backed by a local path on disk.
+    pub fn add_local_file(&mut self, parent: u64, name: &str, path: PathBuf, size: u64) -> u64 {
+        let sanitized = sanitize_path_component(name);
+        let uploaded = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let ino = self.next_inode();
+        self.nodes.push(TreeNode::File {
+            ino,
+            name: sanitized,
+            parent,
+            size,
+            content: FileContent::Local { path },
+            uploaded,
+        });
+        if let Some(TreeNode::Directory { children, .. }) = self.get_mut(parent) {
+            children.push(ino);
+        }
+        ino
+    }
+
+    /// Take the lazy-population data from a directory, leaving `lazy: None`.
+    /// Returns `None` if the directory has already been populated or is not lazy.
+    pub fn take_lazy(&mut self, ino: u64) -> Option<LazyDir> {
+        if let Some(TreeNode::Directory { lazy, .. }) = self.get_mut(ino) {
+            lazy.take()
+        } else {
+            None
+        }
     }
 
     /// Build by-sha256, by-type, and by-date subtrees from blob descriptors.
@@ -578,7 +643,9 @@ mod tests {
                 assert_eq!(*size, 5);
                 match content {
                     FileContent::Static(data) => assert_eq!(data, b"hello"),
-                    FileContent::Remote { .. } => panic!("expected Static content"),
+                    FileContent::Remote { .. } | FileContent::Local { .. } => {
+                        panic!("expected Static content")
+                    }
                 }
             }
             TreeNode::Directory { .. } => panic!("expected File node"),
@@ -614,7 +681,9 @@ mod tests {
                         assert_eq!(sha256, SHA_A);
                         assert_eq!(mime_type.as_deref(), Some("image/png"));
                     }
-                    FileContent::Static(_) => panic!("expected Remote content"),
+                    FileContent::Static(_) | FileContent::Local { .. } => {
+                        panic!("expected Remote content")
+                    }
                 }
             }
             TreeNode::Directory { .. } => panic!("expected File node"),

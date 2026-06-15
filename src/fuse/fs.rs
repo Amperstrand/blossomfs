@@ -35,7 +35,7 @@ use sha2::{Digest, Sha256};
 
 use crate::blossom::client::{BlossomClient, BlossomClientError};
 use crate::blossom::descriptor::BlobDescriptor;
-use crate::fuse::tree::{FileContent, NodeKind, Tree, TreeNode};
+use crate::fuse::tree::{FileContent, LazyDir, NodeKind, Tree, TreeNode};
 use crate::nostr::auth::create_upload_auth_header;
 
 // ---------------------------------------------------------------------------
@@ -277,6 +277,20 @@ impl BlossomFS {
                         Ok(full_data[offset..end].to_vec())
                     }
                 }
+                FileContent::Local { path } => {
+                    let path = path.clone();
+                    drop(tree);
+                    let data = std::fs::read(&path).map_err(|e| {
+                        tracing::error!("local read failed for {:?}: {}", path, e);
+                        ReadError::Fetch
+                    })?;
+                    if offset >= data.len() {
+                        Ok(Vec::new())
+                    } else {
+                        let end = (offset + size).min(data.len());
+                        Ok(data[offset..end].to_vec())
+                    }
+                }
             },
         }
     }
@@ -300,6 +314,44 @@ impl BlossomFS {
                 })
                 .collect(),
         )
+    }
+
+    /// If `ino` is a lazy directory, populate it now (clone + walk + fill tree).
+    /// No-op if already populated or not a lazy directory.
+    fn populate_if_lazy(&self, ino: u64) {
+        let lazy = {
+            let mut tree = self.tree.write().unwrap();
+            tree.take_lazy(ino)
+        };
+
+        if let Some(LazyDir::GitRepo {
+            clone_url,
+            cache_path,
+        }) = lazy
+        {
+            tracing::info!("lazy populating inode {} from {}", ino, clone_url);
+
+            if let Err(e) = crate::git::browse::clone_repo(&clone_url, &cache_path) {
+                tracing::error!("clone failed for {}: {}", clone_url, e);
+                let mut tree = self.tree.write().unwrap();
+                tree.add_static_file(
+                    ino,
+                    "CLONE_FAILED.txt",
+                    format!(
+                        "Failed to clone repository:\n  URL: {}\n  Error: {}\n",
+                        clone_url, e
+                    )
+                    .into_bytes(),
+                );
+                return;
+            }
+
+            let added = {
+                let mut tree = self.tree.write().unwrap();
+                crate::git::browse::walk_repo_tree(&cache_path, &mut tree, ino)
+            };
+            tracing::info!("populated {} files/dirs for inode {}", added, ino);
+        }
     }
 
     /// Total number of nodes in the tree (used for statfs `files` count).
@@ -532,6 +584,8 @@ impl Filesystem for BlossomFS {
     // ---- Read-only operations ----
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        self.populate_if_lazy(parent.0);
+
         let name_str = match name.to_str() {
             Some(s) => s,
             None => {
@@ -594,7 +648,7 @@ impl Filesystem for BlossomFS {
                             data.clone()
                         }
                     }
-                    FileContent::Remote { .. } => {
+                    FileContent::Remote { .. } | FileContent::Local { .. } => {
                         drop(tree);
                         reply.error(Errno::EACCES);
                         return;
@@ -650,6 +704,8 @@ impl Filesystem for BlossomFS {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        self.populate_if_lazy(ino.0);
+
         let entries = match self.list_directory(ino.0) {
             Some(e) => e,
             None => {
@@ -1850,7 +1906,9 @@ mod tests {
                         assert_eq!(url, "https://cdn.example.com/abc123");
                         assert_eq!(sha256, "abc123");
                     }
-                    FileContent::Static(_) => panic!("expected Remote content after update"),
+                    FileContent::Static(_) | FileContent::Local { .. } => {
+                        panic!("expected Remote content after update")
+                    }
                 }
             }
             _ => panic!("expected File node"),

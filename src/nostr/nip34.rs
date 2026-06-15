@@ -14,7 +14,7 @@ use thiserror::Error;
 
 use nostr_sdk::prelude::*;
 
-use crate::fuse::tree::Tree;
+use crate::fuse::tree::{LazyDir, Tree};
 
 #[derive(Error, Debug)]
 pub enum Nip34Error {
@@ -293,7 +293,13 @@ pub fn parse_patch_from_tags(
     })
 }
 
-pub fn build_nip34_tree(tree: &mut Tree, pubkey_hex: &str, data: &Nip34Data) -> usize {
+pub fn build_nip34_tree(
+    tree: &mut Tree,
+    pubkey_hex: &str,
+    data: &Nip34Data,
+    clone_enabled: bool,
+    cache_dir: &std::path::Path,
+) -> usize {
     if data.repos.is_empty() {
         return 0;
     }
@@ -320,7 +326,28 @@ pub fn build_nip34_tree(tree: &mut Tree, pubkey_hex: &str, data: &Nip34Data) -> 
     let mut file_count = 0;
 
     for repo in &data.repos {
-        let repo_dir = tree.get_or_create_dir(pk_dir, &repo.repo_id);
+        let clone_url = repo.clone_urls.first().cloned();
+
+        let repo_dir = if clone_enabled {
+            if let Some(ref url) = clone_url {
+                let cache_path = cache_dir
+                    .join("ngit-clones")
+                    .join(pubkey_hex)
+                    .join(&repo.repo_id);
+                tree.add_lazy_dir(
+                    pk_dir,
+                    &repo.repo_id,
+                    LazyDir::GitRepo {
+                        clone_url: url.clone(),
+                        cache_path,
+                    },
+                )
+            } else {
+                tree.get_or_create_dir(pk_dir, &repo.repo_id)
+            }
+        } else {
+            tree.get_or_create_dir(pk_dir, &repo.repo_id)
+        };
 
         let mut info = String::new();
         info.push_str(&format!("# {}\n\n", repo.name));
@@ -582,7 +609,13 @@ mod tests {
             patches: vec![],
         };
 
-        let count = build_nip34_tree(&mut tree, pubkey, &data);
+        let count = build_nip34_tree(
+            &mut tree,
+            pubkey,
+            &data,
+            false,
+            std::path::Path::new("/tmp/test-cache"),
+        );
         assert!(count >= 2, "should create INFO.md + CLONE_URLS.txt");
 
         let git = tree.lookup(tree.root(), "git");
@@ -651,7 +684,13 @@ mod tests {
             patches: vec![patch],
         };
 
-        let count = build_nip34_tree(&mut tree, pubkey, &data);
+        let count = build_nip34_tree(
+            &mut tree,
+            pubkey,
+            &data,
+            false,
+            std::path::Path::new("/tmp/test-cache"),
+        );
         assert!(count >= 3, "should create INFO.md + issue + patch");
 
         let repo_dir = tree
@@ -680,7 +719,13 @@ mod tests {
             issues: vec![],
             patches: vec![],
         };
-        let count = build_nip34_tree(&mut tree, "pk", &data);
+        let count = build_nip34_tree(
+            &mut tree,
+            "pk",
+            &data,
+            false,
+            std::path::Path::new("/tmp/test-cache"),
+        );
         assert_eq!(count, 0);
         assert!(tree.lookup(tree.root(), "git").is_none());
     }
@@ -730,7 +775,13 @@ mod tests {
             patches: vec![],
         };
 
-        build_nip34_tree(&mut tree, pubkey, &data);
+        build_nip34_tree(
+            &mut tree,
+            pubkey,
+            &data,
+            false,
+            std::path::Path::new("/tmp/test-cache"),
+        );
 
         let pk_dir = tree
             .lookup(tree.root(), "git")
