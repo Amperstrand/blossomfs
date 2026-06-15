@@ -45,6 +45,7 @@ pub enum FileContent {
         url: String,
         sha256: String,
         mime_type: Option<String>,
+        expires: Option<u64>,
     },
 }
 
@@ -252,6 +253,7 @@ impl Tree {
                 url,
                 sha256,
                 mime_type,
+                expires: None,
             },
             uploaded,
         });
@@ -410,6 +412,31 @@ impl Tree {
             && let TreeNode::File { size: s, .. } = node
         {
             *s = size;
+            return true;
+        }
+        false
+    }
+
+    pub fn expires(&self, ino: u64) -> Option<u64> {
+        if let Some(TreeNode::File {
+            content: FileContent::Remote { expires, .. },
+            ..
+        }) = self.get(ino)
+        {
+            *expires
+        } else {
+            None
+        }
+    }
+
+    pub fn set_expires(&mut self, ino: u64, expires: Option<u64>) -> bool {
+        if let Some(node) = self.get_mut(ino)
+            && let TreeNode::File {
+                content: FileContent::Remote { expires: e, .. },
+                ..
+            } = node
+        {
+            *e = expires;
             return true;
         }
         false
@@ -581,6 +608,7 @@ mod tests {
                         url,
                         sha256,
                         mime_type,
+                        expires: _,
                     } => {
                         assert_eq!(url, "https://cdn.example.com/blob");
                         assert_eq!(sha256, SHA_A);
@@ -999,5 +1027,53 @@ mod tests {
             None,
             "nonexistent inode should return None"
         );
+    }
+
+    #[test]
+    fn s25_expires_accessor() {
+        let mut tree = Tree::new();
+        let ino = tree.add_remote_file(
+            1,
+            "blob.png",
+            "https://cdn.example.com/blob".to_string(),
+            SHA_A.to_string(),
+            42,
+            Some("image/png".to_string()),
+            1700000000,
+        );
+
+        assert_eq!(
+            tree.expires(ino),
+            None,
+            "new Remote file should have no expiry"
+        );
+
+        assert!(tree.set_expires(ino, Some(1794395471)));
+        assert_eq!(tree.expires(ino), Some(1794395471));
+
+        assert!(tree.set_expires(ino, None));
+        assert_eq!(tree.expires(ino), None);
+    }
+
+    #[test]
+    fn s26_set_expires_returns_false_for_static() {
+        let mut tree = Tree::new();
+        let ino = tree.add_file_to_dir(1, "file.txt", FileContent::Static(b"hi".to_vec()), 2, 0);
+        assert!(!tree.set_expires(ino, Some(123)));
+        assert_eq!(tree.expires(ino), None);
+    }
+
+    #[test]
+    fn s27_set_expires_returns_false_for_directory() {
+        let mut tree = Tree::new();
+        let dir_ino = tree.add_directory(1, "subdir");
+        assert!(!tree.set_expires(dir_ino, Some(123)));
+        assert_eq!(tree.expires(dir_ino), None);
+    }
+
+    #[test]
+    fn s28_expires_nonexistent_inode() {
+        let tree = Tree::new();
+        assert_eq!(tree.expires(999), None);
     }
 }
