@@ -34,6 +34,7 @@ use nostr_sdk::prelude::Keys;
 use sha2::{Digest, Sha256};
 
 use crate::blossom::client::{BlossomClient, BlossomClientError};
+use crate::blossom::descriptor::BlobDescriptor;
 use crate::fuse::tree::{FileContent, NodeKind, Tree, TreeNode};
 use crate::nostr::auth::create_upload_auth_header;
 
@@ -73,8 +74,9 @@ pub struct BlossomFS {
     read_only: bool,
     next_fh: AtomicU64,
     ttl: Duration,
-    /// Maximum writable bytes per file. Writes exceeding this return EFBIG.
     max_write_bytes: usize,
+    free_period_secs: u64,
+    max_free_size_bytes: usize,
 }
 
 impl BlossomFS {
@@ -91,6 +93,8 @@ impl BlossomFS {
             next_fh: AtomicU64::new(1),
             ttl,
             max_write_bytes: 100 * 1024 * 1024,
+            free_period_secs: 30 * 86400,
+            max_free_size_bytes: 1024 * 1024,
         }
     }
 
@@ -105,6 +109,8 @@ impl BlossomFS {
         cache_base: PathBuf,
         runtime_handle: tokio::runtime::Handle,
         ttl: Duration,
+        free_period_secs: u64,
+        max_free_size_bytes: usize,
     ) -> Self {
         Self {
             tree: Arc::new(RwLock::new(tree)),
@@ -117,6 +123,8 @@ impl BlossomFS {
             next_fh: AtomicU64::new(1),
             ttl,
             max_write_bytes: 100 * 1024 * 1024,
+            free_period_secs,
+            max_free_size_bytes,
         }
     }
 
@@ -125,6 +133,7 @@ impl BlossomFS {
     /// Files created via the FUSE `create` callback are buffered in memory
     /// and uploaded to `server_url` when flushed (closed). The BUD-11 auth
     /// header is signed with `keys`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_rw(
         tree: Tree,
         cache_base: PathBuf,
@@ -133,6 +142,8 @@ impl BlossomFS {
         server_url: String,
         ttl: Duration,
         max_write_bytes: usize,
+        free_period_secs: u64,
+        max_free_size_bytes: usize,
     ) -> Self {
         Self {
             tree: Arc::new(RwLock::new(tree)),
@@ -145,6 +156,8 @@ impl BlossomFS {
             next_fh: AtomicU64::new(1),
             ttl,
             max_write_bytes,
+            free_period_secs,
+            max_free_size_bytes,
         }
     }
 
@@ -245,12 +258,17 @@ impl BlossomFS {
                     };
 
                     tracing::debug!("fetching blob {} from {}", sha256, url);
-                    let full_data = handle
+                    let (full_data, expiry) = handle
                         .block_on(fetch_and_cache(&url, &sha256, cache_base))
                         .map_err(|e| {
                             tracing::error!("fetch failed for {}: {}", sha256, e);
                             ReadError::Fetch
                         })?;
+
+                    if let Some(ts) = expiry {
+                        let mut tree = self.tree.write().unwrap();
+                        tree.set_expires(ino, Some(ts));
+                    }
 
                     if offset >= full_data.len() {
                         Ok(Vec::new())
@@ -296,6 +314,30 @@ impl BlossomFS {
         count
     }
 
+    fn compute_effective_expiry(&self, ino: u64) -> Option<u64> {
+        let tree = self.tree.read().unwrap();
+        let node = tree.get(ino)?;
+        let TreeNode::File {
+            content,
+            size: file_size,
+            uploaded,
+            ..
+        } = node
+        else {
+            return None;
+        };
+        let FileContent::Remote { expires, .. } = content else {
+            return None;
+        };
+        if let Some(ts) = *expires {
+            Some(ts)
+        } else if (*file_size as usize) <= self.max_free_size_bytes {
+            Some(*uploaded + self.free_period_secs)
+        } else {
+            None
+        }
+    }
+
     /// Look up a child inode by name within a parent directory.
     fn lookup_child(&self, parent: u64, name: &str) -> Option<u64> {
         let tree = self.tree.read().unwrap();
@@ -339,81 +381,57 @@ impl BlossomFS {
         let client = BlossomClient::new(server_url);
         const MAX_ATTEMPTS: u32 = 3;
 
-        for attempt in 1..=MAX_ATTEMPTS {
-            let result = handle.block_on(client.upload_blob(data.clone(), &auth_header));
-
-            match result {
-                Ok(desc) => {
-                    tracing::info!(
-                        "upload complete: {} bytes → {} (sha256={})",
-                        desc.size,
-                        desc.url,
-                        &desc.sha256[..16]
-                    );
-                    let mut tree = self.tree.write().unwrap();
-                    tree.update_file_node(
-                        ino,
-                        FileContent::Remote {
-                            url: desc.url,
-                            sha256: desc.sha256,
-                            mime_type: desc.mime_type,
-                        },
-                        desc.size,
-                        desc.uploaded,
-                    );
-                    return Ok(());
+        match handle.block_on(upload_with_retry(
+            &client,
+            &data,
+            &auth_header,
+            MAX_ATTEMPTS,
+        )) {
+            Ok(desc) => {
+                tracing::info!(
+                    "upload complete: {} bytes → {} (sha256={})",
+                    desc.size,
+                    desc.url,
+                    &desc.sha256[..16]
+                );
+                let mut tree = self.tree.write().unwrap();
+                tree.update_file_node(
+                    ino,
+                    FileContent::Remote {
+                        url: desc.url,
+                        sha256: desc.sha256,
+                        mime_type: desc.mime_type,
+                        expires: None,
+                    },
+                    desc.size,
+                    desc.uploaded,
+                );
+                Ok(())
+            }
+            Err(BlossomClientError::ServerError { status, body }) => {
+                match status {
+                    402 => tracing::error!(
+                        "upload failed: HTTP 402 Payment Required — \
+                         server demands payment for {} bytes",
+                        data_len
+                    ),
+                    413 => tracing::error!(
+                        "upload failed: HTTP 413 Payload Too Large — \
+                         file exceeds server limit"
+                    ),
+                    s => tracing::error!(
+                        "upload failed: HTTP {} — {}",
+                        s,
+                        body.chars().take(200).collect::<String>()
+                    ),
                 }
-                Err(BlossomClientError::ServerError { status, ref body }) => {
-                    if is_retryable_status(status) && attempt < MAX_ATTEMPTS {
-                        let delay = 1u64 << (attempt - 1);
-                        tracing::warn!(
-                            "upload attempt {}/{} got HTTP {}, retrying in {}s",
-                            attempt,
-                            MAX_ATTEMPTS,
-                            status,
-                            delay
-                        );
-                        std::thread::sleep(Duration::from_secs(delay));
-                        continue;
-                    }
-                    match status {
-                        402 => tracing::error!(
-                            "upload failed: HTTP 402 Payment Required — \
-                             server demands payment for {} bytes",
-                            data_len
-                        ),
-                        413 => tracing::error!(
-                            "upload failed: HTTP 413 Payload Too Large — \
-                             file exceeds server limit"
-                        ),
-                        s => tracing::error!(
-                            "upload failed: HTTP {} — {}",
-                            s,
-                            body.chars().take(200).collect::<String>()
-                        ),
-                    }
-                    return Err(());
-                }
-                Err(ref e) => {
-                    if attempt < MAX_ATTEMPTS {
-                        let delay = 1u64 << (attempt - 1);
-                        tracing::warn!(
-                            "upload attempt {}/{} network error, retrying in {}s: {}",
-                            attempt,
-                            MAX_ATTEMPTS,
-                            delay,
-                            e
-                        );
-                        std::thread::sleep(Duration::from_secs(delay));
-                        continue;
-                    }
-                    tracing::error!("upload failed after {} attempts: {}", MAX_ATTEMPTS, e);
-                    return Err(());
-                }
+                Err(())
+            }
+            Err(e) => {
+                tracing::error!("upload failed after {} attempts: {}", MAX_ATTEMPTS, e);
+                Err(())
             }
         }
-
-        Err(())
     }
 
     /// Remove a failed write's file from the tree.
@@ -425,6 +443,49 @@ impl BlossomFS {
 
 fn is_retryable_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504)
+}
+
+/// Upload a blob with retry on transient failures.
+///
+/// Retries up to `max_attempts` times with exponential backoff (1 s, 2 s, …)
+/// on transient failures (network errors, HTTP 429/5xx). Non-retryable errors
+/// (HTTP 4xx except 429) return immediately.
+///
+/// Returns the blob descriptor on success, or the last error on failure.
+async fn upload_with_retry(
+    client: &BlossomClient,
+    data: &[u8],
+    auth_header: &str,
+    max_attempts: u32,
+) -> Result<BlobDescriptor, BlossomClientError> {
+    for attempt in 1..=max_attempts {
+        match client.upload_blob(data.to_vec(), auth_header).await {
+            Ok(desc) => return Ok(desc),
+            Err(e) => {
+                let retry = match &e {
+                    BlossomClientError::ServerError { status, .. } => {
+                        is_retryable_status(*status) && attempt < max_attempts
+                    }
+                    _ => attempt < max_attempts,
+                };
+
+                if !retry {
+                    return Err(e);
+                }
+
+                let delay = 1u64 << (attempt - 1);
+                tracing::warn!(
+                    "upload attempt {}/{} error, retrying in {}s: {}",
+                    attempt,
+                    max_attempts,
+                    delay,
+                    e
+                );
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+            }
+        }
+    }
+    unreachable!("loop body always returns or continues")
 }
 
 // ---------------------------------------------------------------------------
@@ -1071,15 +1132,66 @@ impl Filesystem for BlossomFS {
         reply.error(Errno::EROFS);
     }
 
-    fn getxattr(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _name: &OsStr,
-        _size: u32,
-        reply: ReplyXattr,
-    ) {
-        reply.error(Errno::ENODATA);
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        if name != OsStr::new("user.blossom.expiry") {
+            reply.error(Errno::ENODATA);
+            return;
+        }
+
+        let Some(ts) = self.compute_effective_expiry(ino.into()) else {
+            reply.error(Errno::ENODATA);
+            return;
+        };
+
+        let value = ts.to_string();
+        let value_bytes = value.as_bytes();
+
+        if size == 0 {
+            reply.size(value_bytes.len() as u32);
+        } else if (size as usize) >= value_bytes.len() {
+            reply.data(value_bytes);
+        } else {
+            reply.error(Errno::ERANGE);
+        }
+    }
+
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let tree = self.tree.read().unwrap();
+        let node = match tree.get(ino.into()) {
+            Some(n) => n,
+            None => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+        };
+
+        let TreeNode::File { content, .. } = node else {
+            if size == 0 {
+                reply.size(0);
+            } else {
+                reply.data(&[]);
+            }
+            return;
+        };
+
+        let FileContent::Remote { .. } = content else {
+            if size == 0 {
+                reply.size(0);
+            } else {
+                reply.data(&[]);
+            }
+            return;
+        };
+
+        let xattr_list = b"user.blossom.expiry\0";
+
+        if size == 0 {
+            reply.size(xattr_list.len() as u32);
+        } else if (size as usize) >= xattr_list.len() {
+            reply.data(xattr_list);
+        } else {
+            reply.error(Errno::ERANGE);
+        }
     }
 
     fn setxattr(
@@ -1372,7 +1484,14 @@ mod tests {
     }
 
     fn make_cache_fs(tree: Tree, cache_base: PathBuf, handle: tokio::runtime::Handle) -> BlossomFS {
-        BlossomFS::new_with_cache(tree, cache_base, handle, Duration::from_secs(1))
+        BlossomFS::new_with_cache(
+            tree,
+            cache_base,
+            handle,
+            Duration::from_secs(1),
+            30 * 86400,
+            1024 * 1024,
+        )
     }
 
     // ============== S18: Remote file with cache — fetch and return content ==============
@@ -1554,6 +1673,8 @@ mod tests {
             "http://localhost:8080".to_string(),
             Duration::from_secs(1),
             100 * 1024 * 1024,
+            30 * 86400,
+            1024 * 1024,
         );
         (rt, fs)
     }
@@ -1702,6 +1823,7 @@ mod tests {
                     url: "https://cdn.example.com/abc123".to_string(),
                     sha256: "abc123".to_string(),
                     mime_type: Some("application/octet-stream".to_string()),
+                    expires: None,
                 },
                 100,
                 1700000000,
@@ -1867,6 +1989,354 @@ mod tests {
         assert!(
             fs.cache_base.is_some(),
             "cache_base should be set in RW mode"
+        );
+    }
+
+    // ============== Retry logic tests (R01-R09) ==============
+
+    fn upload_desc_json() -> serde_json::Value {
+        serde_json::json!({
+            "url": "https://cdn.example.com/abc",
+            "sha256": "abc",
+            "size": 9,
+            "type": "application/octet-stream",
+            "uploaded": 1700000000
+        })
+    }
+
+    // ============== R01: is_retryable_status returns true for transient errors ====
+
+    #[test]
+    fn r01_is_retryable_status_true_for_transient_errors() {
+        assert!(is_retryable_status(429));
+        assert!(is_retryable_status(500));
+        assert!(is_retryable_status(502));
+        assert!(is_retryable_status(503));
+        assert!(is_retryable_status(504));
+    }
+
+    // ============== R02: is_retryable_status false for permanent errors ============
+
+    #[test]
+    fn r02_is_retryable_status_false_for_permanent_errors() {
+        assert!(!is_retryable_status(200));
+        assert!(!is_retryable_status(400));
+        assert!(!is_retryable_status(401));
+        assert!(!is_retryable_status(402));
+        assert!(!is_retryable_status(403));
+        assert!(!is_retryable_status(404));
+        assert!(!is_retryable_status(413));
+    }
+
+    // ============== R03: upload_with_retry succeeds on first attempt ==============
+
+    #[tokio::test(start_paused = true)]
+    async fn r03_upload_succeeds_on_first_attempt() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upload_desc_json()))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = upload_with_retry(&client, b"test data", "tok", 3).await;
+
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+        let desc = result.unwrap();
+        assert_eq!(desc.sha256, "abc");
+        assert_eq!(desc.size, 9);
+    }
+
+    // ============== R04: retry on 429 then succeed on 2nd attempt ================
+
+    #[tokio::test(start_paused = true)]
+    async fn r04_retry_on_429_then_succeed() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upload_desc_json()))
+            .with_priority(2)
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = upload_with_retry(&client, b"test data", "tok", 3).await;
+
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+    }
+
+    // ============== R05: retry on 500 twice then succeed on 3rd attempt ==========
+
+    #[tokio::test(start_paused = true)]
+    async fn r05_retry_on_500_twice_then_succeed() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(2)
+            .with_priority(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upload_desc_json()))
+            .with_priority(2)
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = upload_with_retry(&client, b"test data", "tok", 3).await;
+
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+    }
+
+    // ============== R06: exhaust retries on 500, return ServerError ==============
+
+    #[tokio::test(start_paused = true)]
+    async fn r06_exhaust_retries_on_500() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(3)
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = upload_with_retry(&client, b"test data", "tok", 3).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            BlossomClientError::ServerError { status, .. } => {
+                assert_eq!(status, 500);
+            }
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+    }
+
+    // ============== R07: no retry on 402 Payment Required =======================
+
+    #[tokio::test(start_paused = true)]
+    async fn r07_no_retry_on_402() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(402))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = upload_with_retry(&client, b"test data", "tok", 3).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            BlossomClientError::ServerError { status, .. } => {
+                assert_eq!(status, 402);
+            }
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+    }
+
+    // ============== R08: no retry on 413 Payload Too Large =======================
+
+    #[tokio::test(start_paused = true)]
+    async fn r08_no_retry_on_413() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(413))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = upload_with_retry(&client, b"test data", "tok", 3).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            BlossomClientError::ServerError { status, .. } => {
+                assert_eq!(status, 413);
+            }
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+    }
+
+    // ============== R09: no retry on 404 Not Found ===============================
+
+    #[tokio::test(start_paused = true)]
+    async fn r09_no_retry_on_404() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = upload_with_retry(&client, b"test data", "tok", 3).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            BlossomClientError::ServerError { status, .. } => {
+                assert_eq!(status, 404);
+            }
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+    }
+
+    // ============== Expiry computation tests (e01–e06) ==============
+
+    #[test]
+    fn e01_effective_expiry_server_provided() {
+        let (_rt, fs) = make_rw_fs();
+        let ino = {
+            let mut tree = fs.tree.write().unwrap();
+            tree.add_remote_file(
+                1,
+                "blob.bin",
+                "https://cdn.example.com/blob".to_string(),
+                "abc123".to_string(),
+                100,
+                None,
+                1700000000,
+            )
+        };
+        {
+            let mut tree = fs.tree.write().unwrap();
+            tree.set_expires(ino, Some(1794395471));
+        }
+        assert_eq!(fs.compute_effective_expiry(ino), Some(1794395471));
+    }
+
+    #[test]
+    fn e02_effective_expiry_local_fallback_small_file() {
+        let (_rt, fs) = make_rw_fs();
+        let uploaded: u64 = 1700000000;
+        let ino = {
+            let mut tree = fs.tree.write().unwrap();
+            tree.add_remote_file(
+                1,
+                "small.bin",
+                "https://cdn.example.com/small".to_string(),
+                "small123".to_string(),
+                500_000,
+                None,
+                uploaded,
+            )
+        };
+        let expected = uploaded + 30 * 86400;
+        assert_eq!(fs.compute_effective_expiry(ino), Some(expected));
+    }
+
+    #[test]
+    fn e03_effective_expiry_large_file_no_fallback() {
+        let (_rt, fs) = make_rw_fs();
+        let ino = {
+            let mut tree = fs.tree.write().unwrap();
+            tree.add_remote_file(
+                1,
+                "large.bin",
+                "https://cdn.example.com/large".to_string(),
+                "large123".to_string(),
+                2_000_000,
+                None,
+                1700000000,
+            )
+        };
+        assert_eq!(fs.compute_effective_expiry(ino), None);
+    }
+
+    #[test]
+    fn e04_effective_expiry_directory() {
+        let (_rt, fs) = make_rw_fs();
+        let dir_ino = {
+            let mut tree = fs.tree.write().unwrap();
+            tree.add_directory(1, "subdir")
+        };
+        assert_eq!(fs.compute_effective_expiry(dir_ino), None);
+    }
+
+    #[test]
+    fn e05_effective_expiry_static_file() {
+        let (_rt, fs) = make_rw_fs();
+        let ino = {
+            let mut tree = fs.tree.write().unwrap();
+            tree.add_file_to_dir(1, "file.txt", FileContent::Static(b"hi".to_vec()), 2, 0)
+        };
+        assert_eq!(fs.compute_effective_expiry(ino), None);
+    }
+
+    #[test]
+    fn e06_effective_expiry_nonexistent_inode() {
+        let (_rt, fs) = make_rw_fs();
+        assert_eq!(fs.compute_effective_expiry(999), None);
+    }
+
+    #[test]
+    fn e07_server_expiry_overrides_local_fallback() {
+        let (_rt, fs) = make_rw_fs();
+        let uploaded: u64 = 1700000000;
+        let ino = {
+            let mut tree = fs.tree.write().unwrap();
+            tree.add_remote_file(
+                1,
+                "override.bin",
+                "https://cdn.example.com/blob".to_string(),
+                "override123".to_string(),
+                500_000,
+                None,
+                uploaded,
+            )
+        };
+        {
+            let mut tree = fs.tree.write().unwrap();
+            tree.set_expires(ino, Some(1794395471));
+        }
+        assert_eq!(
+            fs.compute_effective_expiry(ino),
+            Some(1794395471),
+            "server expiry should take priority over local fallback"
         );
     }
 }
