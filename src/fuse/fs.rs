@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
 use crate::cache::fetch::fetch_and_cache;
+use crate::cache::object_cache::cache_path;
 
 use fuser::{
     BsdFileFlags, CopyFileRangeFlags, Errno, FileAttr, FileHandle, FileType, Filesystem,
@@ -36,7 +37,7 @@ use sha2::{Digest, Sha256};
 use crate::blossom::client::{BlossomClient, BlossomClientError};
 use crate::blossom::descriptor::BlobDescriptor;
 use crate::fuse::tree::{FileContent, LazyDir, NodeKind, Tree, TreeNode};
-use crate::nostr::auth::create_upload_auth_header;
+use crate::nostr::auth::{create_delete_auth_header, create_upload_auth_header};
 
 // ---------------------------------------------------------------------------
 // WriteBuffer
@@ -854,6 +855,49 @@ impl Filesystem for BlossomFS {
                 return;
             }
         };
+
+        let sha256_to_delete: Option<String> = {
+            let tree = self.tree.read().unwrap();
+            let child_ino = match tree.lookup(parent.0, name_str) {
+                Some(ino) => ino,
+                None => {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+            };
+            match tree.get(child_ino) {
+                Some(TreeNode::File {
+                    content: FileContent::Remote { sha256, .. },
+                    ..
+                }) => Some(sha256.clone()),
+                _ => None,
+            }
+        };
+
+        if let Some(ref sha256) = sha256_to_delete {
+            if let (Some(keys), Some(server_url), Some(handle)) =
+                (&self.keys, &self.server_url, &self.runtime_handle)
+            {
+                match create_delete_auth_header(keys, sha256) {
+                    Ok(auth_header) => {
+                        let client = BlossomClient::new(server_url);
+                        if let Err(e) = handle.block_on(client.delete_blob(sha256, &auth_header)) {
+                            tracing::warn!("server delete failed for {}: {}", sha256, e);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to sign delete auth for {}: {}", sha256, e);
+                    }
+                }
+            }
+
+            if let Some(ref cache_base) = self.cache_base
+                && let Ok(cache_file) = cache_path(cache_base, sha256)
+                && cache_file.exists()
+            {
+                let _ = std::fs::remove_file(&cache_file);
+            }
+        }
 
         let mut tree = self.tree.write().unwrap();
         if tree.remove_file_from_dir(parent.0, name_str) {

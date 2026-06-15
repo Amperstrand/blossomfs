@@ -216,6 +216,40 @@ impl BlossomClient {
         let descriptor: BlobDescriptor = serde_json::from_str(&body)?;
         Ok(descriptor)
     }
+
+    /// Delete a blob from the server (BUD-08).
+    ///
+    /// `DELETE /<sha256>`
+    ///
+    /// # Headers
+    ///
+    /// - `Authorization: Nostr <auth_header>` (base64url-encoded signed event)
+    pub async fn delete_blob(
+        &self,
+        sha256: &str,
+        auth_header: &str,
+    ) -> Result<(), BlossomClientError> {
+        let url = format!("{}/{}", self.base_url, sha256);
+
+        let response = self
+            .client
+            .delete(&url)
+            .header("Authorization", format!("Nostr {auth_header}"))
+            .send()
+            .await?;
+
+        let status = response.status();
+
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(BlossomClientError::ServerError {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -729,6 +763,54 @@ mod tests {
         match result.unwrap_err() {
             BlossomClientError::ServerError { status, .. } => {
                 assert_eq!(status, 500);
+            }
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+    }
+
+    // ── Scenario 17: Happy — delete_blob sends DELETE + Nostr auth ────────
+
+    #[tokio::test]
+    async fn test_delete_blob_sends_nostr_auth_header() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/abc123"))
+            .and(header("Authorization", "Nostr my_token_123"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client.delete_blob("abc123", "my_token_123").await;
+
+        assert!(
+            result.is_ok(),
+            "expected Ok (header matched), got {:?}",
+            result.err()
+        );
+    }
+
+    // ── Scenario 18: Edge — delete_blob 404 → ServerError ────────────────
+
+    #[tokio::test]
+    async fn test_delete_blob_404() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/abc123"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client.delete_blob("abc123", "tok").await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            BlossomClientError::ServerError { status, body } => {
+                assert_eq!(status, 404);
+                assert!(body.contains("not found"));
             }
             other => panic!("expected ServerError, got {other:?}"),
         }

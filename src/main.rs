@@ -412,6 +412,15 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let expiring_soon = tree.collect_expiring_blobs(now_secs, 7 * 86400);
+    if !expiring_soon.is_empty() {
+        tracing::info!("found {} blobs expiring within 7 days", expiring_soon.len());
+    }
+
     // Add virtual files
     let npub_display = args.npub.as_deref().unwrap_or("all");
     let server_count = effective_servers.len();
@@ -421,7 +430,7 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
         server_count,
         blob_count,
         cache_dir: args.cache_dir.display().to_string(),
-        expiring_soon: Vec::new(),
+        expiring_soon,
     };
 
     let readme_content = generate_readme(&mount_info);

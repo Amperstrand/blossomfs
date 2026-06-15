@@ -549,6 +549,36 @@ impl Tree {
             false
         }
     }
+
+    /// Collect all Remote files expiring within the given time window.
+    ///
+    /// Returns `Vec<(name, expiry_timestamp)>` for files where:
+    /// - Content is `FileContent::Remote` with `expires: Some(ts)`
+    /// - `ts > now` (not already expired)
+    /// - `ts <= now + within_secs` (within the window)
+    pub fn collect_expiring_blobs(&self, now: u64, within_secs: u64) -> Vec<(String, u64)> {
+        let threshold = now.saturating_add(within_secs);
+        self.nodes
+            .iter()
+            .filter_map(|node| match node {
+                TreeNode::File {
+                    name,
+                    content:
+                        FileContent::Remote {
+                            expires: Some(exp), ..
+                        },
+                    ..
+                } => {
+                    if *exp > now && *exp <= threshold {
+                        Some((name.clone(), *exp))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 impl Default for Tree {
@@ -1144,5 +1174,127 @@ mod tests {
     fn s28_expires_nonexistent_inode() {
         let tree = Tree::new();
         assert_eq!(tree.expires(999), None);
+    }
+
+    // ============== S29: collect_expiring finds soon-to-expire files ==============
+
+    #[test]
+    fn s29_collect_expiring_finds_soon_expiring() {
+        let mut tree = Tree::new();
+        let now: u64 = 1_700_000_000;
+
+        let ino = tree.add_remote_file(
+            1,
+            "expiring.png",
+            "https://cdn.example.com/blob".to_string(),
+            SHA_A.to_string(),
+            42,
+            Some("image/png".to_string()),
+            now - 86400,
+        );
+        tree.set_expires(ino, Some(now + 3 * 86400));
+
+        let result = tree.collect_expiring_blobs(now, 7 * 86400);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "expiring.png");
+        assert_eq!(result[0].1, now + 3 * 86400);
+    }
+
+    // ============== S30: collect_expiring excludes far-future expiry ==============
+
+    #[test]
+    fn s30_collect_expiring_excludes_far_future() {
+        let mut tree = Tree::new();
+        let now: u64 = 1_700_000_000;
+
+        let ino = tree.add_remote_file(
+            1,
+            "stable.png",
+            "https://cdn.example.com/blob".to_string(),
+            SHA_A.to_string(),
+            42,
+            Some("image/png".to_string()),
+            now,
+        );
+        tree.set_expires(ino, Some(now + 30 * 86400));
+
+        let result = tree.collect_expiring_blobs(now, 7 * 86400);
+        assert!(
+            result.is_empty(),
+            "file expiring in 30 days should not be in 7-day window"
+        );
+    }
+
+    // ============== S31: collect_expiring excludes no-expiry files ==============
+
+    #[test]
+    fn s31_collect_expiring_excludes_no_expiry() {
+        let mut tree = Tree::new();
+        let now: u64 = 1_700_000_000;
+
+        tree.add_remote_file(
+            1,
+            "permanent.png",
+            "https://cdn.example.com/blob".to_string(),
+            SHA_A.to_string(),
+            42,
+            Some("image/png".to_string()),
+            now,
+        );
+
+        let result = tree.collect_expiring_blobs(now, 7 * 86400);
+        assert!(
+            result.is_empty(),
+            "file with no expiry should not be collected"
+        );
+    }
+
+    // ============== S32: collect_expiring excludes Static/Local files ==============
+
+    #[test]
+    fn s32_collect_expiring_excludes_non_remote() {
+        let mut tree = Tree::new();
+        let now: u64 = 1_700_000_000;
+
+        tree.add_static_file(1, "readme.txt", b"hello".to_vec());
+        tree.add_file_to_dir(
+            1,
+            "local.txt",
+            FileContent::Local {
+                path: std::path::PathBuf::from("/tmp/x"),
+            },
+            1,
+            now,
+        );
+
+        let result = tree.collect_expiring_blobs(now, 7 * 86400);
+        assert!(
+            result.is_empty(),
+            "Static and Local files should not be collected"
+        );
+    }
+
+    // ============== S33: collect_expiring finds files in nested dirs ==============
+
+    #[test]
+    fn s33_collect_expiring_nested_dirs() {
+        let mut tree = Tree::new();
+        let now: u64 = 1_700_000_000;
+
+        let dir = tree.add_directory(1, "subdir");
+        let ino = tree.add_remote_file(
+            dir,
+            "nested.png",
+            "https://cdn.example.com/blob".to_string(),
+            SHA_A.to_string(),
+            42,
+            Some("image/png".to_string()),
+            now,
+        );
+        tree.set_expires(ino, Some(now + 2 * 86400));
+
+        let result = tree.collect_expiring_blobs(now, 7 * 86400);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "nested.png");
     }
 }
