@@ -38,25 +38,22 @@ pub enum FetchError {
 /// 1. If cache hit (file exists at cache path), read and return cached bytes.
 /// 2. If cache miss:
 ///    a. Download all bytes from URL
-///    b. Compute SHA-256 hash
-///    c. Verify hash matches `expected_sha256`
-///    d. On match: ensure cache dir exists, write temp file, atomic rename → cache path
-///    e. On mismatch: return `HashMismatch` error (no file written)
-/// 3. Return the content bytes.
-///
-/// # PoC Limitation
-///
-/// This implementation loads the entire blob into memory via `resp.bytes()`
-/// before computing the hash. For large blobs, a streaming approach that
-/// writes chunks to a temp file while hashing would be more memory-efficient.
+///    b. Capture `Sunset` header (RFC 8594) → unix timestamp if present
+///    c. Compute SHA-256 hash
+///    d. Verify hash matches `expected_sha256`
+///    e. On match: ensure cache dir exists, write temp file, atomic rename → cache path
+///    f. On mismatch: return `HashMismatch` error (no file written)
+/// 3. Return `(content_bytes, Option<expiry_unix_ts>)`.
 pub async fn fetch_and_cache(
     url: &str,
     expected_sha256: &str,
     cache_base: &Path,
-) -> Result<Vec<u8>, FetchError> {
+) -> Result<(Vec<u8>, Option<u64>), FetchError> {
     // 1. Check cache first — serve from disk if available
     if cache_exists(cache_base, expected_sha256) {
-        return read_cached(cache_base, expected_sha256).map_err(FetchError::Cache);
+        return read_cached(cache_base, expected_sha256)
+            .map(|bytes| (bytes, None))
+            .map_err(FetchError::Cache);
     }
 
     // 2a. Download — error_for_status converts 4xx/5xx into Err
@@ -73,6 +70,19 @@ pub async fn fetch_and_cache(
         return Err(FetchError::ResponseTooLarge { size: len });
     }
 
+    // 2b. Capture Sunset header (RFC 8594) before consuming response body
+    let sunset_ts = resp
+        .headers()
+        .get("sunset")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| httpdate::parse_http_date(s).ok())
+        .and_then(|sys_time| {
+            sys_time
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs())
+        });
+
     let bytes = resp.bytes().await?;
 
     // Double-check actual byte count (Content-Length can be absent or lie)
@@ -82,12 +92,12 @@ pub async fn fetch_and_cache(
         });
     }
 
-    // 2b. Compute SHA-256
+    // 2c. Compute SHA-256
     let mut hasher = Sha256::new();
     hasher.update(bytes.as_ref());
     let computed = hex::encode(hasher.finalize());
 
-    // 2c. Verify hash (case-insensitive — expected may be uppercase)
+    // 2d. Verify hash (case-insensitive — expected may be uppercase)
     if computed != expected_sha256.to_lowercase() {
         return Err(FetchError::HashMismatch {
             expected: expected_sha256.to_string(),
@@ -95,7 +105,7 @@ pub async fn fetch_and_cache(
         });
     }
 
-    // 2d. Ensure cache directory exists for this hash
+    // 2e. Ensure cache directory exists for this hash
     ensure_cache_dir(cache_base, expected_sha256)?;
 
     // Write to temp file, then atomic rename (POSIX rename is atomic on same filesystem)
@@ -115,7 +125,7 @@ pub async fn fetch_and_cache(
         return Err(e.into());
     }
 
-    Ok(bytes.to_vec())
+    Ok((bytes.to_vec(), sunset_ts))
 }
 
 #[cfg(test)]
@@ -151,7 +161,7 @@ mod tests {
 
         let result = fetch_and_cache(&url, &hash, cache_base.path()).await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), content.to_vec());
+        assert_eq!(result.unwrap().0, content.to_vec());
     }
 
     // --- TDD Scenario 2: Second call serves from cache (no HTTP) ---
@@ -175,12 +185,12 @@ mod tests {
         // First call: downloads
         let result1 = fetch_and_cache(&url, &hash, cache_base.path()).await;
         assert!(result1.is_ok());
-        assert_eq!(result1.unwrap(), content.to_vec());
+        assert_eq!(result1.unwrap().0, content.to_vec());
 
         // Second call: served from cache, no HTTP
         let result2 = fetch_and_cache(&url, &hash, cache_base.path()).await;
         assert!(result2.is_ok());
-        assert_eq!(result2.unwrap(), content.to_vec());
+        assert_eq!(result2.unwrap().0, content.to_vec());
     }
 
     // --- TDD Scenario 3: Large content (1MB+) ---
@@ -202,7 +212,7 @@ mod tests {
 
         let result = fetch_and_cache(&url, &hash, cache_base.path()).await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), content);
+        assert_eq!(result.unwrap().0, content);
     }
 
     // --- TDD Scenario 4: SHA-256 mismatch ---
@@ -302,7 +312,7 @@ mod tests {
 
         let result = fetch_and_cache(url, &hash, cache_base.path()).await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), content.to_vec());
+        assert_eq!(result.unwrap().0, content.to_vec());
     }
 
     // --- TDD Scenario 8: Uppercase hash normalized to lowercase ---
@@ -325,7 +335,7 @@ mod tests {
 
         let result = fetch_and_cache(&url, &hash_upper, cache_base.path()).await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), content.to_vec());
+        assert_eq!(result.unwrap().0, content.to_vec());
 
         // Verify cache file exists at lowercase path
         assert!(cache_exists(cache_base.path(), &hash_lower));
@@ -350,7 +360,7 @@ mod tests {
 
         let result = fetch_and_cache(&url, &hash, cache_base.path()).await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), content);
+        assert_eq!(result.unwrap().0, content);
     }
 
     // --- TDD Scenario 10: Binary content (non-UTF8) preserved ---
@@ -372,7 +382,7 @@ mod tests {
 
         let result = fetch_and_cache(&url, &hash, cache_base.path()).await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), content);
+        assert_eq!(result.unwrap().0, content);
     }
 
     // --- TDD Scenario 11: Cache directory structure created correctly ---
@@ -442,5 +452,100 @@ mod tests {
             FetchError::Http(_) => {}
             other => panic!("Expected FetchError::Http, got {other:?}"),
         }
+    }
+
+    // --- Sunset header capture ---
+
+    #[tokio::test]
+    async fn test_sunset_header_captured() {
+        let mock_server = MockServer::start().await;
+        let content = b"sunset test";
+        let hash = sha256_hex(content);
+
+        Mock::given(method("GET"))
+            .and(path("/sunset"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(content.to_vec())
+                    .insert_header("Sunset", "Wed, 11 Nov 2026 11:11:11 GMT"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let url = format!("{}/sunset", mock_server.uri());
+        let cache_base = tempfile::tempdir().unwrap();
+
+        let (bytes, expiry) = fetch_and_cache(&url, &hash, cache_base.path())
+            .await
+            .unwrap();
+        assert_eq!(bytes, content.to_vec());
+        assert_eq!(expiry, Some(1794395471));
+    }
+
+    #[tokio::test]
+    async fn test_no_sunset_header_returns_none() {
+        let mock_server = MockServer::start().await;
+        let content = b"no sunset";
+        let hash = sha256_hex(content);
+
+        Mock::given(method("GET"))
+            .and(path("/no-sunset"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(content.to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        let url = format!("{}/no-sunset", mock_server.uri());
+        let cache_base = tempfile::tempdir().unwrap();
+
+        let (bytes, expiry) = fetch_and_cache(&url, &hash, cache_base.path())
+            .await
+            .unwrap();
+        assert_eq!(bytes, content.to_vec());
+        assert_eq!(expiry, None);
+    }
+
+    #[tokio::test]
+    async fn test_cache_hit_returns_none_expiry() {
+        let content = b"cached sunset";
+        let hash = sha256_hex(content);
+        let cache_base = tempfile::tempdir().unwrap();
+
+        ensure_cache_dir(cache_base.path(), &hash).unwrap();
+        let cache_file = cache_path(cache_base.path(), &hash).unwrap();
+        std::fs::write(&cache_file, content).unwrap();
+
+        let url = "http://127.0.0.1:1/should-not-be-called";
+
+        let (bytes, expiry) = fetch_and_cache(url, &hash, cache_base.path())
+            .await
+            .unwrap();
+        assert_eq!(bytes, content.to_vec());
+        assert_eq!(expiry, None);
+    }
+
+    #[tokio::test]
+    async fn test_malformed_sunset_ignored() {
+        let mock_server = MockServer::start().await;
+        let content = b"bad sunset";
+        let hash = sha256_hex(content);
+
+        Mock::given(method("GET"))
+            .and(path("/bad-sunset"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(content.to_vec())
+                    .insert_header("Sunset", "not-a-date"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let url = format!("{}/bad-sunset", mock_server.uri());
+        let cache_base = tempfile::tempdir().unwrap();
+
+        let (bytes, expiry) = fetch_and_cache(&url, &hash, cache_base.path())
+            .await
+            .unwrap();
+        assert_eq!(bytes, content.to_vec());
+        assert_eq!(expiry, None);
     }
 }
