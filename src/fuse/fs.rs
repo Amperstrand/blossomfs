@@ -501,6 +501,54 @@ impl BlossomFS {
             }
         };
 
+        let client = BlossomClient::new(server_url);
+
+        // ── Dedup: skip upload if blob already exists (BUD-01) ──
+        match handle.block_on(client.head_blob(&sha256_hex)) {
+            Ok(true) => {
+                tracing::info!("blob already exists on server, skipping upload");
+                let mut tree = self.tree.write().unwrap();
+                tree.update_file_node(
+                    ino,
+                    FileContent::Remote {
+                        url: format!("{server_url}/{sha256_hex}"),
+                        sha256: sha256_hex.clone(),
+                        mime_type: None,
+                        expires: None,
+                    },
+                    data_len as u64,
+                    0,
+                );
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!("dedup check failed ({e}), proceeding with upload");
+            }
+        }
+
+        // ── Preflight: check server will accept upload (BUD-06) ──
+        match handle.block_on(client.preflight_upload(
+            &auth_header,
+            &sha256_hex,
+            data_len as u64,
+            "application/octet-stream",
+        )) {
+            Ok(()) => {}
+            Err(BlossomClientError::PaymentRequired { .. }) => {
+                tracing::debug!("preflight: payment required (will handle during upload)");
+            }
+            Err(BlossomClientError::ServerError { status, .. })
+                if matches!(status, 413 | 415 | 429) =>
+            {
+                tracing::error!("preflight rejected upload: HTTP {status}");
+                return Err(());
+            }
+            Err(e) => {
+                tracing::warn!("preflight check failed ({e}), proceeding anyway");
+            }
+        }
+
         tracing::info!(
             "uploading {} bytes for inode {} (sha256={}…)",
             data_len,
@@ -508,7 +556,6 @@ impl BlossomFS {
             &sha256_hex[..16]
         );
 
-        let client = BlossomClient::new(server_url);
         const MAX_ATTEMPTS: u32 = 3;
 
         let result = if data_len > self.multipart_threshold {
@@ -2654,6 +2701,188 @@ mod tests {
             fs.compute_effective_expiry(ino),
             Some(1794395471),
             "server expiry should take priority over local fallback"
+        );
+    }
+
+    // ============== BUD-01/BUD-06: Dedup + Preflight Integration ==============
+
+    #[test]
+    fn test_do_upload_dedup_skips_upload_when_blob_exists() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+
+        let data = b"dedup test data".to_vec();
+        let hash = sha256_hex(&data);
+
+        let (mock_uri, _server) = rt.block_on(async {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+
+            Mock::given(method("HEAD"))
+                .and(path(format!("/{hash}")))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("PUT"))
+                .and(path("/upload"))
+                .respond_with(ResponseTemplate::new(201))
+                .expect(0)
+                .mount(&server)
+                .await;
+
+            (server.uri(), server)
+        });
+
+        let mut tree = Tree::new();
+        let ino = tree.add_file_to_dir(1, "test.bin", FileContent::Static(vec![]), 0, 0);
+
+        let keys = Keys::generate();
+        let fs = BlossomFS::new_rw(
+            tree,
+            PathBuf::from("/tmp/blossomfs-test-cache"),
+            handle,
+            keys,
+            mock_uri,
+            Duration::from_secs(1),
+            100 * 1024 * 1024,
+            30 * 86400,
+            1024 * 1024,
+            0,
+            Arc::new(crate::payment::NoPayment),
+            50 * 1024 * 1024,
+        );
+
+        let result = fs.do_upload(ino, data);
+        assert!(result.is_ok(), "dedup should succeed without uploading");
+    }
+
+    #[test]
+    fn test_do_upload_preflight_413_rejects_without_uploading() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+
+        let data = b"too large test".to_vec();
+        let hash = sha256_hex(&data);
+
+        let (mock_uri, _server) = rt.block_on(async {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+
+            Mock::given(method("HEAD"))
+                .and(path(format!("/{hash}")))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("HEAD"))
+                .and(path("/upload"))
+                .respond_with(ResponseTemplate::new(413))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("PUT"))
+                .and(path("/upload"))
+                .respond_with(ResponseTemplate::new(201))
+                .expect(0)
+                .mount(&server)
+                .await;
+
+            (server.uri(), server)
+        });
+
+        let mut tree = Tree::new();
+        let ino = tree.add_file_to_dir(1, "big.bin", FileContent::Static(vec![]), 0, 0);
+
+        let keys = Keys::generate();
+        let fs = BlossomFS::new_rw(
+            tree,
+            PathBuf::from("/tmp/blossomfs-test-cache"),
+            handle,
+            keys,
+            mock_uri,
+            Duration::from_secs(1),
+            100 * 1024 * 1024,
+            30 * 86400,
+            1024 * 1024,
+            0,
+            Arc::new(crate::payment::NoPayment),
+            50 * 1024 * 1024,
+        );
+
+        let result = fs.do_upload(ino, data);
+        assert!(result.is_err(), "preflight 413 should reject upload");
+    }
+
+    #[test]
+    fn test_do_upload_preflight_error_proceeds_anyway() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+
+        let data = b"advisory preflight test".to_vec();
+        let hash = sha256_hex(&data);
+
+        let (mock_uri, _server) = rt.block_on(async {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+
+            Mock::given(method("HEAD"))
+                .and(path(format!("/{hash}")))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("HEAD"))
+                .and(path("/upload"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("PUT"))
+                .and(path("/upload"))
+                .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "url": "http://mock/blob",
+                    "sha256": hash,
+                    "size": data.len(),
+                    "type": "application/octet-stream",
+                    "uploaded": 1000
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            (server.uri(), server)
+        });
+
+        let mut tree = Tree::new();
+        let ino = tree.add_file_to_dir(1, "advisory.bin", FileContent::Static(vec![]), 0, 0);
+
+        let keys = Keys::generate();
+        let fs = BlossomFS::new_rw(
+            tree,
+            PathBuf::from("/tmp/blossomfs-test-cache"),
+            handle,
+            keys,
+            mock_uri,
+            Duration::from_secs(1),
+            100 * 1024 * 1024,
+            30 * 86400,
+            1024 * 1024,
+            0,
+            Arc::new(crate::payment::NoPayment),
+            50 * 1024 * 1024,
+        );
+
+        let result = fs.do_upload(ino, data);
+        assert!(
+            result.is_ok(),
+            "preflight error should not block upload (advisory)"
         );
     }
 }

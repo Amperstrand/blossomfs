@@ -530,6 +530,73 @@ impl BlossomClient {
         self.complete_multipart_upload(&init.upload_id, auth_header)
             .await
     }
+
+    /// Check if a blob exists on the server (BUD-01).
+    ///
+    /// `HEAD /<sha256>` — returns `true` if the blob exists (200/206),
+    /// `false` if it does not (404).
+    pub async fn head_blob(&self, sha256: &str) -> Result<bool, BlossomClientError> {
+        let url = format!("{}/{}", self.base_url, sha256);
+        let response = self.client.head(&url).send().await?;
+        let status = response.status();
+        if status.is_success() {
+            Ok(true)
+        } else if status.as_u16() == 404 {
+            Ok(false)
+        } else {
+            let body = response.text().await.unwrap_or_default();
+            Err(BlossomClientError::ServerError {
+                status: status.as_u16(),
+                body,
+            })
+        }
+    }
+
+    /// Pre-flight check before upload (BUD-06).
+    ///
+    /// `HEAD /upload` with `X-SHA-256`, `X-Content-Length`, `X-Content-Type`
+    /// headers. Returns `Ok(())` if the server would accept the upload (200),
+    /// `Err(PaymentRequired)` if payment is needed (402),
+    /// or `Err(ServerError)` for other rejections (413, 415, 429, etc.).
+    pub async fn preflight_upload(
+        &self,
+        auth_header: &str,
+        sha256_hex: &str,
+        content_length: u64,
+        content_type: &str,
+    ) -> Result<(), BlossomClientError> {
+        let url = format!("{}/upload", self.base_url);
+        let response = self
+            .client
+            .head(&url)
+            .header("Authorization", format!("Nostr {auth_header}"))
+            .header("X-SHA-256", sha256_hex)
+            .header("X-Content-Length", content_length.to_string())
+            .header("X-Content-Type", content_type)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+
+        if status.as_u16() == 402 {
+            let x_cashu = response
+                .headers()
+                .get("x-cashu")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            return Err(BlossomClientError::PaymentRequired { x_cashu });
+        }
+
+        let body = response.text().await.unwrap_or_default();
+        Err(BlossomClientError::ServerError {
+            status: status.as_u16(),
+            body,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1357,5 +1424,229 @@ mod tests {
             BlossomClientError::ServerError { status, .. } => assert_eq!(status, 404),
             other => panic!("expected ServerError from init, got {other:?}"),
         }
+    }
+
+    // ── BUD-01: head_blob existence check ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_head_blob_exists() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .and(path("/abc123def456"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let exists = client.head_blob("abc123def456").await.unwrap();
+
+        assert!(exists);
+    }
+
+    #[tokio::test]
+    async fn test_head_blob_not_found() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .and(path("/abc123def456"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let exists = client.head_blob("abc123def456").await.unwrap();
+
+        assert!(!exists);
+    }
+
+    #[tokio::test]
+    async fn test_head_blob_206_partial_counts_as_exists() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .and(path("/abc123def456"))
+            .respond_with(ResponseTemplate::new(206))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let exists = client.head_blob("abc123def456").await.unwrap();
+
+        assert!(exists);
+    }
+
+    #[tokio::test]
+    async fn test_head_blob_500_server_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .and(path("/abc123def456"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client.head_blob("abc123def456").await;
+
+        assert!(result.is_err());
+    }
+
+    // ── BUD-06: preflight_upload ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_preflight_upload_200_ok() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .and(path("/upload"))
+            .and(header("X-SHA-256", "abc123"))
+            .and(header("X-Content-Length", "1024"))
+            .and(header("X-Content-Type", "image/png"))
+            .and(header("Authorization", "Nostr tok"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client
+            .preflight_upload("tok", "abc123", 1024, "image/png")
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_preflight_upload_402_payment() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .and(path("/upload"))
+            .respond_with(
+                ResponseTemplate::new(402)
+                    .insert_header("X-Cashu", "creqA12345")
+                    .insert_header("X-Price-Sats", "50"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client
+            .preflight_upload("tok", "abc123", 1048576, "video/mp4")
+            .await;
+
+        match result {
+            Err(BlossomClientError::PaymentRequired { x_cashu }) => {
+                assert_eq!(x_cashu, "creqA12345");
+            }
+            other => panic!("expected PaymentRequired, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_preflight_upload_413_too_large() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(413).insert_header("X-Reason", "File too large"))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client
+            .preflight_upload("tok", "abc123", 5368709120, "video/mp4")
+            .await;
+
+        match result {
+            Err(BlossomClientError::ServerError { status, .. }) => assert_eq!(status, 413),
+            other => panic!("expected ServerError 413, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_preflight_upload_415_unsupported_type() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(415))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client
+            .preflight_upload("tok", "abc123", 1024, "application/exe")
+            .await;
+
+        match result {
+            Err(BlossomClientError::ServerError { status, .. }) => assert_eq!(status, 415),
+            other => panic!("expected ServerError 415, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_preflight_upload_429_rate_limited() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "60"))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client
+            .preflight_upload("tok", "abc123", 1024, "image/png")
+            .await;
+
+        match result {
+            Err(BlossomClientError::ServerError { status, .. }) => assert_eq!(status, 429),
+            other => panic!("expected ServerError 429, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_preflight_upload_404_server_no_support() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client
+            .preflight_upload("tok", "abc123", 1024, "image/png")
+            .await;
+
+        match result {
+            Err(BlossomClientError::ServerError { status, .. }) => assert_eq!(status, 404),
+            other => panic!("expected ServerError 404, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_preflight_upload_sends_all_required_headers() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .and(path("/upload"))
+            .and(header("Authorization", "Nostr mytoken"))
+            .and(header("X-SHA-256", "aabbccdd"))
+            .and(header("X-Content-Length", "999"))
+            .and(header("X-Content-Type", "application/pdf"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client
+            .preflight_upload("mytoken", "aabbccdd", 999, "application/pdf")
+            .await;
+
+        assert!(result.is_ok());
     }
 }
