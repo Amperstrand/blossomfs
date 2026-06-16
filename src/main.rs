@@ -32,6 +32,7 @@ use crate::nostr::keys::{parse_npub, parse_nsec, read_nsec_file};
 use crate::nostr::legacy_drive::{DriveEntry, fetch_drive_events};
 use crate::nostr::nip34::fetch_nip34_events;
 use crate::nostr::nip94::fetch_nip94_events;
+use crate::nostr::persist;
 use crate::util::path::sanitize_hostname;
 
 fn resolve_pubkey_hex(args: &cli::MountArgs) -> Option<String> {
@@ -479,8 +480,9 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Ensure cache directory exists
     std::fs::create_dir_all(&args.cache_dir)?;
 
-    // Resolve nsec for RW mode (only when --read-only=false)
-    let keys = if !args.read_only {
+    // Resolve nsec for RW mode or persistence
+    let need_keys = !args.read_only || args.persist.is_some();
+    let keys = if need_keys {
         if let Some(ref path) = args.nsec_file {
             match read_nsec_file(path) {
                 Ok(k) => Some(k),
@@ -506,6 +508,35 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+
+    // Clone keys for persist publish (keys is moved into BlossomFS below)
+    let persist_keys = keys.clone();
+
+    // Fetch persisted directory structure if --persist is set
+    if let Some(ref drive_name) = args.persist {
+        if let Some(ref k) = keys {
+            if !args.relay.is_empty() {
+                tracing::info!("fetching persisted drive '{}' from relays", drive_name);
+                match rt.block_on(persist::fetch_persist_event(&args.relay, k, drive_name)) {
+                    Ok(tags) => {
+                        let srv = effective_servers.first().map(|s| s.as_str()).unwrap_or("");
+                        tree.apply_persisted(&tags, srv);
+                        tracing::info!("applied {} persisted tags", tags.len());
+                    }
+                    Err(persist::PersistError::NotFound(_)) => {
+                        tracing::info!("no persisted drive found for '{}'", drive_name);
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to fetch persisted drive: {}", e);
+                    }
+                }
+            } else {
+                tracing::warn!("--persist requires --relay to fetch persisted structure");
+            }
+        } else {
+            tracing::warn!("--persist requires --nsec-file or --dangerous-nsec-arg");
+        }
+    }
 
     let server_url = effective_servers.first().cloned();
 
@@ -562,11 +593,38 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
 
+    // Clone tree handle before mount2 consumes fs (for post-unmount persist)
+    let persist_tree = if args.persist.is_some() {
+        Some(fs.tree_handle())
+    } else {
+        None
+    };
+
     fuser::mount2(fs, &args.mountpoint, &options)?;
 
     let _ = sd_notify::notify(&[sd_notify::NotifyState::Stopping]);
 
-    // rt stays alive until here — dropped after mount2 returns (after unmount)
+    // Publish persisted tree after unmount
+    if let (Some(drive_name), Some(tree_arc), Some(pk)) =
+        (&args.persist, persist_tree, &persist_keys)
+        && !args.relay.is_empty()
+    {
+        let tags = tree_arc.read().unwrap().persist_tags();
+        tracing::info!(
+            "publishing {} persisted tags for drive '{}'",
+            tags.len(),
+            drive_name
+        );
+        if let Err(e) = rt.block_on(persist::publish_persist_event(
+            &args.relay,
+            pk,
+            drive_name,
+            &tags,
+        )) {
+            tracing::warn!("failed to publish persisted drive: {}", e);
+        }
+    }
+
     drop(rt);
 
     Ok(())

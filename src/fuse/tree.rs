@@ -337,6 +337,138 @@ impl Tree {
         }
     }
 
+    // ======================== Persistence ========================
+
+    /// Serialize user-created directories and remote files to Nostr tags.
+    ///
+    /// Skips auto-generated structure (the `public/` subtree, README.txt, STATUS.txt,
+    /// git-backed local files). Only user-created directories and user-placed
+    /// remote blob files are persisted.
+    ///
+    /// Format follows Blossom Drive conventions:
+    /// - `["folder", "<path>"]` for empty directories
+    /// - `["x", "<sha256>", "<path>", "<size>", "<mime>"]` for files
+    pub fn persist_tags(&self) -> Vec<Vec<String>> {
+        let mut tags = Vec::new();
+        let mut path = String::new();
+        self.collect_persist(self.root, &mut path, &mut tags);
+        tags
+    }
+
+    fn collect_persist(&self, ino: u64, path: &mut String, tags: &mut Vec<Vec<String>>) {
+        let node = match self.get(ino) {
+            Some(n) => n,
+            None => return,
+        };
+
+        match node {
+            TreeNode::Directory { children, .. } => {
+                let is_root = ino == self.root;
+
+                if !is_root && !path.starts_with("/public") {
+                    tags.push(vec!["folder".to_string(), path.clone()]);
+                }
+
+                for &child_ino in children {
+                    let child = match self.get(child_ino) {
+                        Some(n) => n,
+                        None => continue,
+                    };
+                    let child_name = match child {
+                        TreeNode::Directory { name, .. } => name.as_str(),
+                        TreeNode::File { name, .. } => name.as_str(),
+                    };
+
+                    let prev_len = path.len();
+                    path.push('/');
+                    path.push_str(child_name);
+
+                    if !path.starts_with("/public") {
+                        self.collect_persist(child_ino, path, tags);
+                    }
+
+                    path.truncate(prev_len);
+                }
+            }
+            TreeNode::File { content, size, .. } => {
+                if let FileContent::Remote {
+                    sha256, mime_type, ..
+                } = content
+                {
+                    tags.push(vec![
+                        "x".to_string(),
+                        sha256.clone(),
+                        path.clone(),
+                        size.to_string(),
+                        mime_type.as_deref().unwrap_or("").to_string(),
+                    ]);
+                }
+            }
+        }
+    }
+
+    /// Apply persisted tags to rebuild user-created directory structure.
+    ///
+    /// Processes `folder` tags first (to create empty dirs), then `x` tags
+    /// (which create parent dirs as needed). Blob URLs are derived as
+    /// `{server_url}/{sha256}`.
+    pub fn apply_persisted(&mut self, tags: &[Vec<String>], server_url: &str) {
+        for tag in tags {
+            if tag.len() >= 2 && tag[0] == "folder" {
+                let path = &tag[1];
+                let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+                let mut parent = self.root;
+                for part in &parts {
+                    if !part.is_empty() {
+                        parent = self.get_or_create_dir(parent, part);
+                    }
+                }
+            }
+        }
+
+        for tag in tags {
+            if tag.len() >= 4 && tag[0] == "x" {
+                let sha256 = &tag[1];
+                let path = &tag[2];
+                let size: u64 = tag[3].parse().unwrap_or(0);
+                let mime = if tag.len() >= 5 && !tag[4].is_empty() {
+                    Some(tag[4].clone())
+                } else {
+                    None
+                };
+
+                let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+                if parts.is_empty() || parts[0].is_empty() {
+                    continue;
+                }
+
+                let mut parent = self.root;
+                for dir_name in &parts[..parts.len().saturating_sub(1)] {
+                    if !dir_name.is_empty() {
+                        parent = self.get_or_create_dir(parent, dir_name);
+                    }
+                }
+
+                let file_name = parts.last().unwrap_or(&"");
+                if !file_name.is_empty() {
+                    let url = format!("{}/{}", server_url.trim_end_matches('/'), sha256);
+                    if self.lookup(parent, file_name).is_none() {
+                        self.add_remote_file(
+                            parent,
+                            file_name,
+                            url,
+                            sha256.to_string(),
+                            size,
+                            mime,
+                            0,
+                            None,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Build by-sha256, by-type, and by-date subtrees from blob descriptors.
     ///
     /// Descriptors with invalid sha256 are silently skipped.
@@ -1309,5 +1441,161 @@ mod tests {
         let result = tree.collect_expiring_blobs(now, 7 * 86400);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "nested.png");
+    }
+
+    // ============== S34: persist_tags serializes user dirs ==============
+
+    #[test]
+    fn s34_persist_tags_user_dirs_and_files() {
+        let mut tree = Tree::new();
+        let docs = tree.add_directory(1, "docs");
+        let _file = tree.add_remote_file(
+            docs,
+            "report.pdf",
+            "https://blossom.psbt.me/abc".to_string(),
+            SHA_A.to_string(),
+            1024,
+            Some("application/pdf".to_string()),
+            1700000000,
+            None,
+        );
+
+        let tags = tree.persist_tags();
+
+        let has_folder = tags.iter().any(|t| t[0] == "folder" && t[1] == "/docs");
+        assert!(has_folder, "should have folder tag for /docs");
+
+        let has_file = tags
+            .iter()
+            .any(|t| t[0] == "x" && t[1] == SHA_A && t[2] == "/docs/report.pdf");
+        assert!(has_file, "should have file tag for /docs/report.pdf");
+    }
+
+    // ============== S35: persist_tags skips public subtree ==============
+
+    #[test]
+    fn s35_persist_tags_skips_public() {
+        let mut tree = Tree::new();
+        let public = tree.add_directory(1, "public");
+        let _auto_file = tree.add_remote_file(
+            public,
+            SHA_A,
+            "https://blossom.psbt.me/abc".to_string(),
+            SHA_A.to_string(),
+            42,
+            None,
+            1700000000,
+            None,
+        );
+
+        let tags = tree.persist_tags();
+        assert!(
+            tags.is_empty(),
+            "public/ subtree should not produce any tags"
+        );
+    }
+
+    // ============== S36: persist_tags skips static files ==============
+
+    #[test]
+    fn s36_persist_tags_skips_static_and_local() {
+        let mut tree = Tree::new();
+        let _static = tree.add_static_file(1, "README.txt", b"hello".to_vec());
+
+        let tags = tree.persist_tags();
+        assert!(tags.is_empty(), "static files should not be persisted");
+    }
+
+    // ============== S37: apply_persisted rebuilds structure ==============
+
+    #[test]
+    fn s37_apply_persisted_rebuilds_dirs_and_files() {
+        let mut tree = Tree::new();
+        let tags = vec![
+            vec!["folder".to_string(), "/projects".to_string()],
+            vec![
+                "x".to_string(),
+                SHA_B.to_string(),
+                "/projects/main.rs".to_string(),
+                "2048".to_string(),
+                "text/plain".to_string(),
+            ],
+            vec!["folder".to_string(), "/empty".to_string()],
+        ];
+
+        tree.apply_persisted(&tags, "https://blossom.psbt.me");
+
+        let projects_ino = tree
+            .lookup(1, "projects")
+            .expect("projects dir should exist");
+        let _empty_ino = tree.lookup(1, "empty").expect("empty dir should exist");
+        let file_ino = tree
+            .lookup(projects_ino, "main.rs")
+            .expect("main.rs should exist");
+
+        let node = tree.get(file_ino).unwrap();
+        if let TreeNode::File { size, .. } = node {
+            assert_eq!(*size, 2048);
+        } else {
+            panic!("expected file node");
+        }
+    }
+
+    // ============== S38: round-trip persist → apply ==============
+
+    #[test]
+    fn s38_round_trip_persist_apply() {
+        let mut tree1 = Tree::new();
+        let docs = tree1.add_directory(1, "docs");
+        let images = tree1.add_directory(docs, "images");
+        let _f1 = tree1.add_remote_file(
+            docs,
+            "readme.md",
+            "https://srv.example.com/aaa".to_string(),
+            SHA_A.to_string(),
+            100,
+            Some("text/markdown".to_string()),
+            0,
+            None,
+        );
+        let _f2 = tree1.add_remote_file(
+            images,
+            "logo.png",
+            "https://srv.example.com/bbb".to_string(),
+            SHA_B.to_string(),
+            200,
+            Some("image/png".to_string()),
+            0,
+            None,
+        );
+
+        let tags = tree1.persist_tags();
+        assert!(!tags.is_empty(), "should have tags");
+
+        let mut tree2 = Tree::new();
+        tree2.apply_persisted(&tags, "https://srv.example.com");
+
+        let docs2 = tree2.lookup(1, "docs").expect("docs should exist");
+        let images2 = tree2.lookup(docs2, "images").expect("images should exist");
+        let f1 = tree2
+            .lookup(docs2, "readme.md")
+            .expect("readme.md should exist");
+        let f2 = tree2
+            .lookup(images2, "logo.png")
+            .expect("logo.png should exist");
+
+        let n1 = tree2.get(f1).unwrap();
+        if let TreeNode::File { size, .. } = n1 {
+            assert_eq!(*size, 100);
+        } else {
+            panic!("expected file");
+        }
+
+        let n2 = tree2.get(f2).unwrap();
+        if let TreeNode::File { size, .. } = n2 {
+            assert_eq!(*size, 200);
+        } else {
+            panic!("expected file");
+        }
     }
 }

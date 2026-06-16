@@ -1,0 +1,113 @@
+# BlossomFS
+
+> FUSE filesystem for Blossom/Nostr blob storage. Mount remote blobs as local files. Upload, download, and organize with standard Unix tools.
+
+## Install
+
+```bash
+sudo apt-get install -y fuse3 libfuse3-dev pkg-config build-essential
+cargo build --release
+# Binary: ./target/release/blossomfs
+```
+
+## Mount (read-only)
+
+```bash
+mkdir -p /mnt/bfs
+blossomfs mount \
+  --npub npub1... \
+  --server https://blossom.psbt.me \
+  --mountpoint /mnt/bfs
+```
+
+Unmount: `fusermount3 -u /mnt/bfs`
+
+## Mount (read-write)
+
+```bash
+blossomfs mount \
+  --npub npub1... \
+  --server https://blossom.psbt.me \
+  --mountpoint /mnt/bfs \
+  --read-only=false \
+  --nsec-file /path/to/nsec.txt
+```
+
+Write files directly into the mount. BlossomFS uploads on close via BUD-02/BUD-11. Delete with `rm`.
+
+## Mount (persistent directories)
+
+```bash
+blossomfs mount \
+  --npub npub1... \
+  --server https://blossom.psbt.me \
+  --relay wss://relay.damus.io \
+  --mountpoint /mnt/bfs \
+  --persist mydrive \
+  --nsec-file /path/to/nsec.txt
+```
+
+User-created directories survive unmount/remount via kind 30078 Nostr events. Auto-generated `/public/` tree comes from BUD-12 listing each mount.
+
+## Directory layout
+
+```
+/public/<pubkey>/servers/<host>/     BUD-12 blobs from each server
+/public/<pubkey>/all-servers/         All blobs deduplicated
+/drives/<d-tag>/                      Legacy Blossom Drives (kind 30563)
+/metadata/<sha256>/                   NIP-94 file metadata (kind 1063)
+/repos/<pubkey>/<repo>/               NIP-34 git repos
+/tollgate/<project>/<version>/        Tollgate releases
+README.txt                            Mount info and usage
+STATUS.txt                            TTL and free-period status
+```
+
+## Agent cloud storage patterns
+
+Store agent artifacts (logs, configs, checkpoints) on Blossom:
+
+```bash
+# Write a file (uploads to Blossom server)
+echo '{"task":"completed","score":0.95}' > /mnt/bfs/results.json
+
+# Create persistent directory structure
+mkdir -p /mnt/bfs/agent/checkpoints
+cp checkpoint.json /mnt/bfs/agent/checkpoints/
+
+# Read back on next session (after remount with --persist)
+cat /mnt/bfs/agent/checkpoints/checkpoint.json
+```
+
+## Config file
+
+Optional TOML at `~/.config/blossomfs/config.toml`:
+
+```toml
+npub = "npub1..."
+server = ["https://blossom.psbt.me"]
+relay = ["wss://relay.damus.io"]
+mountpoint = "/mnt/bfs"
+max_cache_size = 500     # MB, 0=unlimited
+ttl_secs = 31536000      # 1 year (blobs are immutable)
+```
+
+CLI flags override config. Env vars prefixed `BLOSSOMFS_`.
+
+## CLI flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--mountpoint` | required | FUSE mount path |
+| `--npub` | - | Bech32 pubkey |
+| `--pubkey` | - | Hex pubkey |
+| `--server` | - | Blossom server URL (repeatable) |
+| `--relay` | - | Nostr relay for discovery (repeatable) |
+| `--manifest` | - | Local JSON blob descriptors |
+| `--read-only` | true | false for RW upload mode |
+| `--nsec-file` | - | File containing nsec for RW/persist |
+| `--persist` | - | Drive name for directory persistence |
+| `--cache-dir` | /tmp/blossomfs | Local blob cache |
+| `--max-cache-size` | 0 | Max cache MB (0=unlimited, FIFO eviction) |
+| `--ttl-secs` | 31536000 | FUSE cache TTL |
+| `--config` | - | Path to TOML config |
+| `--daemon` | false | Fork to background |

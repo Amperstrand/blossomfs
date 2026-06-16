@@ -14,4 +14,5 @@ pub mod keys;
 pub mod legacy_drive;
 pub mod nip34;
 pub mod nip94;
+pub mod persist;
 pub mod tollgate;

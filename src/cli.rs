@@ -326,6 +326,15 @@ pub struct MountArgs {
     #[arg(long, default_value_t = 0)]
     pub max_cache_size: u64,
 
+    /// Persist directory structure to Nostr (kind 30078).
+    ///
+    /// On mount, loads saved user-created directories from relays.
+    /// On unmount, publishes the current structure so it survives remounts.
+    /// Value is the drive name (used as NIP-33 d-tag identifier).
+    /// Requires --nsec-file or --dangerous-nsec-arg for signing.
+    #[arg(long)]
+    pub persist: Option<String>,
+
     #[arg(long)]
     pub config: Option<PathBuf>,
 
@@ -354,6 +363,7 @@ impl Default for MountArgs {
             free_period_days: 30,
             max_free_size_mb: 1,
             max_cache_size: 0,
+            persist: None,
             config: None,
             daemon: false,
         }

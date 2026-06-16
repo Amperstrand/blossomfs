@@ -168,6 +168,13 @@ impl BlossomFS {
         }
     }
 
+    /// Get a handle to the tree for post-unmount extraction.
+    ///
+    /// Used by `--persist` to serialize the tree after the FUSE session ends.
+    pub fn tree_handle(&self) -> Arc<RwLock<Tree>> {
+        Arc::clone(&self.tree)
+    }
+
     // ======================== Internal testable helpers ========================
 
     /// Build a [`FileAttr`] for the given inode.
