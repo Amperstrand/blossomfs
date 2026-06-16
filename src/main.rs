@@ -9,6 +9,7 @@ mod blossom;
 mod cache;
 mod cli;
 mod config;
+mod control;
 mod fuse;
 mod git;
 mod nostr;
@@ -593,14 +594,29 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
 
-    // Clone tree handle before mount2 consumes fs (for post-unmount persist)
+    // Extract shared state before mount2 consumes fs
+    let tree_arc = fs.tree_handle();
     let persist_tree = if args.persist.is_some() {
-        Some(fs.tree_handle())
+        Some(tree_arc.clone())
     } else {
         None
     };
+    let frozen_handle = fs.frozen_handle();
+    let cache_base = fs.cache_base_path();
+    let fs_read_only = !is_rw;
+
+    let socket_path = args.cache_dir.join("blossomfs.sock");
+    let _control_task = rt.handle().spawn(crate::control::run_control_socket(
+        socket_path.clone(),
+        tree_arc,
+        frozen_handle,
+        cache_base,
+        fs_read_only,
+    ));
 
     fuser::mount2(fs, &args.mountpoint, &options)?;
+
+    let _ = std::fs::remove_file(&socket_path);
 
     let _ = sd_notify::notify(&[sd_notify::NotifyState::Stopping]);
 

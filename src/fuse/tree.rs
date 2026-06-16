@@ -113,7 +113,10 @@ impl Tree {
         self.root
     }
 
-    /// Get a node reference by inode number.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
     pub fn get(&self, ino: u64) -> Option<&TreeNode> {
         if ino >= 1 {
             self.nodes.get((ino - 1) as usize)

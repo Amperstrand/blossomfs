@@ -13,12 +13,12 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
 use crate::cache::fetch::fetch_and_cache;
@@ -79,6 +79,11 @@ pub struct BlossomFS {
     free_period_secs: u64,
     max_free_size_bytes: usize,
     max_cache_bytes: u64,
+    /// Sha256 hashes currently being fetched. Prevents duplicate HTTP
+    /// downloads when multiple FUSE read() calls hit the same uncached blob.
+    fetch_in_progress: Arc<(Mutex<HashSet<String>>, Condvar)>,
+    /// When true, all write operations return EROFS even in RW mode.
+    frozen: Arc<AtomicBool>,
 }
 
 impl BlossomFS {
@@ -98,6 +103,8 @@ impl BlossomFS {
             free_period_secs: 30 * 86400,
             max_free_size_bytes: 1024 * 1024,
             max_cache_bytes: 0,
+            fetch_in_progress: Arc::new((Mutex::new(HashSet::new()), Condvar::new())),
+            frozen: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -130,6 +137,8 @@ impl BlossomFS {
             free_period_secs,
             max_free_size_bytes,
             max_cache_bytes,
+            fetch_in_progress: Arc::new((Mutex::new(HashSet::new()), Condvar::new())),
+            frozen: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -165,6 +174,8 @@ impl BlossomFS {
             free_period_secs,
             max_free_size_bytes,
             max_cache_bytes,
+            fetch_in_progress: Arc::new((Mutex::new(HashSet::new()), Condvar::new())),
+            frozen: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -173,6 +184,21 @@ impl BlossomFS {
     /// Used by `--persist` to serialize the tree after the FUSE session ends.
     pub fn tree_handle(&self) -> Arc<RwLock<Tree>> {
         Arc::clone(&self.tree)
+    }
+
+    /// Get a handle to the frozen flag for the control socket.
+    pub fn frozen_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.frozen)
+    }
+
+    /// Get the cache base path for the control socket.
+    pub fn cache_base_path(&self) -> Option<PathBuf> {
+        self.cache_base.clone()
+    }
+
+    /// Check if the filesystem is frozen (write-locked at runtime).
+    pub fn is_frozen(&self) -> bool {
+        self.frozen.load(Ordering::Relaxed)
     }
 
     // ======================== Internal testable helpers ========================
@@ -272,12 +298,30 @@ impl BlossomFS {
                     };
 
                     tracing::debug!("fetching blob {} from {}", sha256, url);
-                    let (full_data, expiry) = handle
+
+                    let (map, cvar) = &*self.fetch_in_progress;
+                    {
+                        let mut guard = map.lock().unwrap();
+                        while guard.contains(&sha256) {
+                            guard = cvar.wait(guard).unwrap();
+                        }
+                        guard.insert(sha256.clone());
+                    }
+
+                    let fetch_result = handle
                         .block_on(fetch_and_cache(&url, &sha256, cache_base))
                         .map_err(|e| {
                             tracing::error!("fetch failed for {}: {}", sha256, e);
                             ReadError::Fetch
-                        })?;
+                        });
+
+                    {
+                        let mut guard = map.lock().unwrap();
+                        guard.remove(&sha256);
+                        cvar.notify_all();
+                    }
+
+                    let (full_data, expiry) = fetch_result?;
 
                     if self.max_cache_bytes > 0
                         && let Err(e) = crate::cache::object_cache::evict_oldest(
@@ -634,7 +678,7 @@ impl Filesystem for BlossomFS {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let is_writable = !self.read_only && flags.0 & 0o3 != 0;
+        let is_writable = !self.read_only && !self.is_frozen() && flags.0 & 0o3 != 0;
 
         if !is_writable {
             let tree = self.tree.read().unwrap();
@@ -796,7 +840,7 @@ impl Filesystem for BlossomFS {
         _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        if self.read_only {
+        if self.read_only || self.is_frozen() {
             reply.error(Errno::EROFS);
             return;
         }
@@ -832,7 +876,7 @@ impl Filesystem for BlossomFS {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        if self.read_only {
+        if self.read_only || self.is_frozen() {
             reply.error(Errno::EROFS);
             return;
         }
@@ -867,7 +911,7 @@ impl Filesystem for BlossomFS {
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        if self.read_only {
+        if self.read_only || self.is_frozen() {
             reply.error(Errno::EROFS);
             return;
         }
@@ -933,7 +977,7 @@ impl Filesystem for BlossomFS {
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        if self.read_only {
+        if self.read_only || self.is_frozen() {
             reply.error(Errno::EROFS);
             return;
         }
@@ -996,7 +1040,7 @@ impl Filesystem for BlossomFS {
         _flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        reply.error(if self.read_only {
+        reply.error(if self.read_only || self.is_frozen() {
             Errno::EROFS
         } else {
             Errno::ENOSYS
@@ -1011,7 +1055,7 @@ impl Filesystem for BlossomFS {
         _newname: &OsStr,
         reply: ReplyEntry,
     ) {
-        reply.error(if self.read_only {
+        reply.error(if self.read_only || self.is_frozen() {
             Errno::EROFS
         } else {
             Errno::ENOSYS
@@ -1030,7 +1074,7 @@ impl Filesystem for BlossomFS {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        if self.read_only {
+        if self.read_only || self.is_frozen() {
             reply.error(Errno::EROFS);
             return;
         }
@@ -1159,7 +1203,7 @@ impl Filesystem for BlossomFS {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        if self.read_only {
+        if self.read_only || self.is_frozen() {
             reply.error(Errno::EROFS);
             return;
         }
@@ -1777,6 +1821,71 @@ mod tests {
         let result = fs.read_content(4, 0, 100);
         assert_eq!(result, Err(ReadError::Remote));
         assert_eq!(format!("{:?}", ReadError::Remote.to_errno()), "Errno(5)");
+    }
+
+    // ============== S43: Concurrent reads dedup to single HTTP fetch ==============
+
+    #[test]
+    fn s43_concurrent_reads_single_fetch() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+
+        let content = b"dedup test blob for s43";
+        let hash = sha256_hex(content);
+
+        let (mock_server_uri, mock_server) = rt.block_on(async {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/dedup43"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(content.to_vec()))
+                .expect(1)
+                .mount(&server)
+                .await;
+            (server.uri(), server)
+        });
+
+        let url = format!("{}/dedup43", mock_server_uri);
+        let tree = make_cache_test_tree(url, hash, content.len() as u64);
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let fs = Arc::new(make_cache_fs(tree, cache_dir.path().to_path_buf(), handle));
+
+        let fs_a = Arc::clone(&fs);
+        let fs_b = Arc::clone(&fs);
+
+        let h1 = std::thread::spawn(move || fs_a.read_content(2, 0, 1024));
+        let h2 = std::thread::spawn(move || fs_b.read_content(2, 0, 1024));
+
+        let data1 = h1.join().unwrap().expect("thread 1 read should succeed");
+        let data2 = h2.join().unwrap().expect("thread 2 read should succeed");
+
+        assert_eq!(data1, content.to_vec());
+        assert_eq!(data2, content.to_vec());
+
+        drop(mock_server);
+    }
+
+    // ============== S44: Frozen flag blocks writes but allows reads ==============
+
+    #[test]
+    fn s44_freeze_flag_behavior() {
+        let (_rt, fs) = make_rw_fs();
+
+        assert!(!fs.is_frozen(), "should start unfrozen");
+
+        fs.frozen_handle().store(true, Ordering::Relaxed);
+        assert!(fs.is_frozen(), "should be frozen after flag set");
+
+        let data = fs
+            .read_content(2, 0, 100)
+            .expect("reads should still work when frozen");
+        assert_eq!(data, b"Hello, World!");
+
+        fs.frozen_handle().store(false, Ordering::Relaxed);
+        assert!(!fs.is_frozen(), "should be unfrozen after flag cleared");
     }
 
     // ============== Write logic tests (S23+) ==============
