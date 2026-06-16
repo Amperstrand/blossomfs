@@ -1,0 +1,22 @@
+[Unit]
+Description=BlossomFS FUSE mount (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/blossomfs mount --mountpoint %i --config /etc/blossomfs/blossomfs.toml
+ExecStop=/usr/bin/fusermount3 -u %i
+Restart=on-failure
+RestartSec=5
+
+# Run as a dedicated user for safety
+User=blossomfs
+Group=blossomfs
+
+# Allow FUSE mounts
+CapabilityBoundingSet=SYS_ADMIN
+AmbientCapabilities=SYS_ADMIN
+
+[Install]
+WantedBy=multi-user.target

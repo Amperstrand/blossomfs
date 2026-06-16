@@ -1,0 +1,22 @@
+# /etc/fstab entries for BlossomFS
+#
+# BlossomFS does not support direct fstab mounting (it requires a
+# userspace daemon). Use systemd or an init script instead.
+#
+# Option 1: systemd template service (recommended)
+#
+#   1. Copy contrib/blossomfs@.service to /etc/systemd/system/
+#   2. Copy contrib/blossomfs.toml.example to /etc/blossomfs/blossomfs.toml
+#   3. Enable and start:
+#
+#       sudo systemctl enable blossomfs@/mnt/blossom.service
+#       sudo systemctl start blossomfs@/mnt/blossom.service
+#
+# Option 2: /etc/fstab with a helper script
+#
+#   Add a line like this (requires a mount.blossomfs helper script):
+#
+#   /etc/blossomfs/blossomfs.toml  /mnt/blossom  fuse.blossomfs  defaults,config=/etc/blossomfs/blossomfs.toml  0  0
+#
+#   The helper script (mount.blossomfs) would need to be placed in /sbin/
+#   and wrap the blossomfs binary.

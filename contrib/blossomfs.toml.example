@@ -1,0 +1,45 @@
+# BlossomFS Configuration File
+#
+# Copy to ~/.config/blossomfs.toml and edit.
+# All fields are optional. CLI arguments always override config values.
+#
+# Usage:
+#   blossomfs mount --mountpoint /mnt/blossom --config ~/.config/blossomfs.toml
+
+# Bech32 public key (npub1...)
+# npub = "npub1..."
+
+# Hex public key (alternative to npub)
+# pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+# Blossom server URLs
+# server = [
+#     "https://blossom.example.com",
+# ]
+
+# Nostr relays for server discovery (NIP-B7)
+# relay = [
+#     "wss://relay.example.com",
+# ]
+
+# Private key file for RW mode (nsec read from file, never sent to server)
+# nsec_file = "/home/user/.config/blossomfs/nsec.txt"
+
+# Cache directory for downloaded blobs (default: /tmp/blossomfs)
+# cache_dir = "/var/cache/blossomfs"
+
+# Read-only mode (true = read-only, false = read-write)
+# read_only = true
+
+# FUSE cache TTL in seconds (default: 31536000 = 1 year, safe for immutable blobs)
+# ttl_secs = 31536000
+
+# NIP-34 git browser settings
+# nip34_relay = ["wss://relay.ngit.dev"]
+# nip34_pubkey = "npub1..."
+# nip34_clone = false
+
+# Write limits (RW mode only)
+# max_write_mb = 100
+# free_period_days = 30
+# max_free_size_mb = 1
