@@ -527,6 +527,7 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
                     (args.max_write_mb as usize) * 1024 * 1024,
                     args.free_period_days * 86400,
                     (args.max_free_size_mb as usize) * 1024 * 1024,
+                    args.max_cache_size * 1024 * 1024,
                 ),
                 true,
             )
@@ -541,6 +542,7 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
                     Duration::from_secs(args.ttl_secs),
                     args.free_period_days * 86400,
                     (args.max_free_size_mb as usize) * 1024 * 1024,
+                    args.max_cache_size * 1024 * 1024,
                 ),
                 false,
             )

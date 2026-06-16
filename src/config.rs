@@ -24,6 +24,7 @@ pub struct BlossomConfig {
     pub max_write_mb: Option<u64>,
     pub free_period_days: Option<u64>,
     pub max_free_size_mb: Option<u64>,
+    pub max_cache_size: Option<u64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -105,6 +106,11 @@ impl BlossomConfig {
             && let Some(v) = self.max_free_size_mb
         {
             args.max_free_size_mb = v;
+        }
+        if !is_explicit("max-cache-size")
+            && let Some(v) = self.max_cache_size
+        {
+            args.max_cache_size = v;
         }
     }
 }

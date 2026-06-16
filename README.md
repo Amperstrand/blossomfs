@@ -144,6 +144,7 @@ ttl_secs = 31536000
 max_write_mb = 100
 free_period_days = 30
 max_free_size_mb = 1
+max_cache_size = 0
 nip34_relay = ["wss://relay.example.com"]
 nip34_pubkey = "npub1..."
 nip34_clone = false
@@ -179,8 +180,10 @@ OPTIONS:
       --ttl-secs <SECONDS>          FUSE cache TTL in seconds (default: 31536000 = 1 year)
       --max-write-mb <MB>           Max write buffer size per file in MB (default: 100)
       --free-period-days <DAYS>     Free storage period for small files in days (default: 30)
-      --max-free-size-mb <MB>       Max file size eligible for free storage in MB (default: 1)
-      --config <PATH>               Path to TOML configuration file
+--max-free-size-mb <MB>       Max file size eligible for free storage in MB (default: 1)
+--max-cache-size <MB>         Max cache size in MB, 0 = unlimited (default: 0)
+                              When exceeded, oldest blobs are evicted (FIFO).
+--config <PATH>               Path to TOML configuration file
       --daemon                      Run in background (fork to daemon after mount)
 ```
 
@@ -353,7 +356,7 @@ If the error persists, the server may be serving incorrect content.
 
 - No rename or link operations (returns ENOSYS in RW mode)
 - Write buffers are in-memory, designed for files under 100 MB (adjustable via `--max-write-mb`)
-- No eviction policy for the local cache (safe to delete `cache/objects/` manually)
+- Cache eviction is FIFO by file mtime; use `--max-cache-size` to enable automatic cleanup (0 = unlimited)
 - Append-only drive namespace is designed but not implemented
 - No range requests during fetch; the full blob is downloaded regardless of read offset
 

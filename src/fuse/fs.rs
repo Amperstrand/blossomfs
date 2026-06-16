@@ -78,6 +78,7 @@ pub struct BlossomFS {
     max_write_bytes: usize,
     free_period_secs: u64,
     max_free_size_bytes: usize,
+    max_cache_bytes: u64,
 }
 
 impl BlossomFS {
@@ -96,6 +97,7 @@ impl BlossomFS {
             max_write_bytes: 100 * 1024 * 1024,
             free_period_secs: 30 * 86400,
             max_free_size_bytes: 1024 * 1024,
+            max_cache_bytes: 0,
         }
     }
 
@@ -112,6 +114,7 @@ impl BlossomFS {
         ttl: Duration,
         free_period_secs: u64,
         max_free_size_bytes: usize,
+        max_cache_bytes: u64,
     ) -> Self {
         Self {
             tree: Arc::new(RwLock::new(tree)),
@@ -126,6 +129,7 @@ impl BlossomFS {
             max_write_bytes: 100 * 1024 * 1024,
             free_period_secs,
             max_free_size_bytes,
+            max_cache_bytes,
         }
     }
 
@@ -145,6 +149,7 @@ impl BlossomFS {
         max_write_bytes: usize,
         free_period_secs: u64,
         max_free_size_bytes: usize,
+        max_cache_bytes: u64,
     ) -> Self {
         Self {
             tree: Arc::new(RwLock::new(tree)),
@@ -159,6 +164,7 @@ impl BlossomFS {
             max_write_bytes,
             free_period_secs,
             max_free_size_bytes,
+            max_cache_bytes,
         }
     }
 
@@ -265,6 +271,16 @@ impl BlossomFS {
                             tracing::error!("fetch failed for {}: {}", sha256, e);
                             ReadError::Fetch
                         })?;
+
+                    if self.max_cache_bytes > 0
+                        && let Err(e) = crate::cache::object_cache::evict_oldest(
+                            cache_base,
+                            self.max_cache_bytes,
+                            &sha256,
+                        )
+                    {
+                        tracing::warn!("cache eviction failed: {}", e);
+                    }
 
                     if let Some(ts) = expiry {
                         let mut tree = self.tree.write().unwrap();
@@ -1593,6 +1609,7 @@ mod tests {
             Duration::from_secs(1),
             30 * 86400,
             1024 * 1024,
+            0,
         )
     }
 
@@ -1777,6 +1794,7 @@ mod tests {
             100 * 1024 * 1024,
             30 * 86400,
             1024 * 1024,
+            0,
         );
         (rt, fs)
     }

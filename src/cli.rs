@@ -321,6 +321,11 @@ pub struct MountArgs {
     #[arg(long, default_value_t = 1)]
     pub max_free_size_mb: u64,
 
+    /// Maximum cache size in megabytes. 0 = unlimited (default).
+    /// When exceeded, oldest cached blobs are evicted (FIFO).
+    #[arg(long, default_value_t = 0)]
+    pub max_cache_size: u64,
+
     #[arg(long)]
     pub config: Option<PathBuf>,
 
@@ -348,6 +353,7 @@ impl Default for MountArgs {
             max_write_mb: 100,
             free_period_days: 30,
             max_free_size_mb: 1,
+            max_cache_size: 0,
             config: None,
             daemon: false,
         }

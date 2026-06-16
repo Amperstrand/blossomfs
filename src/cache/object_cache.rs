@@ -78,6 +78,73 @@ pub fn ensure_cache_dir(base: &Path, sha256: &str) -> Result<PathBuf, CacheError
     Ok(dir)
 }
 
+/// Evict oldest cached blobs (FIFO by modification time) until total cache
+/// size is at or below `max_bytes`. The file named `keep` is never evicted.
+/// Pass `max_bytes = 0` to disable eviction (no-op).
+pub fn evict_oldest(cache_base: &Path, max_bytes: u64, keep: &str) -> Result<(), CacheError> {
+    if max_bytes == 0 {
+        return Ok(());
+    }
+
+    let objects_dir = cache_base.join("objects");
+    if !objects_dir.exists() {
+        return Ok(());
+    }
+
+    let mut entries: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
+    let mut total_size: u64 = 0;
+
+    for entry in walkdir::WalkDir::new(&objects_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let mtime = metadata
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let size = metadata.len();
+        total_size += size;
+        entries.push((entry.path().to_path_buf(), size, mtime));
+    }
+
+    if total_size <= max_bytes {
+        return Ok(());
+    }
+
+    entries.sort_by_key(|(_, _, mtime)| *mtime);
+
+    for (path, size, _) in &entries {
+        if total_size <= max_bytes {
+            break;
+        }
+
+        if path.file_name().map(|n| n.to_string_lossy().into_owned()) == Some(keep.to_string()) {
+            continue;
+        }
+
+        match fs::remove_file(path) {
+            Ok(()) => {
+                total_size -= size;
+                tracing::debug!(
+                    "evicted {:?} ({} bytes, {} remaining)",
+                    path,
+                    size,
+                    total_size
+                );
+            }
+            Err(e) => {
+                tracing::warn!("failed to evict {:?}: {}", path, e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,5 +292,79 @@ mod tests {
         let path = result.unwrap();
         let path_str = path.to_str().unwrap();
         assert!(!path_str.contains(".."));
+    }
+
+    // --- evict_oldest tests ---
+
+    use std::fs::FileTimes;
+    use std::time::{Duration, SystemTime};
+
+    fn write_cache_file(base: &Path, sha: &str, content: &[u8], mtime_offset_secs: u64) {
+        ensure_cache_dir(base, sha).unwrap();
+        let path = cache_path(base, sha).unwrap();
+        fs::write(&path, content).unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let times = FileTimes::new()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1000 + mtime_offset_secs));
+        file.set_times(times).unwrap();
+    }
+
+    const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const SHA_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    #[test]
+    fn test_evict_under_limit_no_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cache_file(dir.path(), SHA_A, b"AAA", 0);
+
+        evict_oldest(dir.path(), 1024, "none").unwrap();
+
+        assert!(cache_exists(dir.path(), SHA_A));
+    }
+
+    #[test]
+    fn test_evict_over_limit_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cache_file(dir.path(), SHA_A, b"AAAA", 0);
+        write_cache_file(dir.path(), SHA_B, b"BBBB", 10);
+        write_cache_file(dir.path(), SHA_C, b"CCCC", 20);
+
+        // Total is 12 bytes, limit to 8 → evict SHA_A (oldest, 4 bytes)
+        evict_oldest(dir.path(), 8, "none").unwrap();
+
+        assert!(!cache_exists(dir.path(), SHA_A));
+        assert!(cache_exists(dir.path(), SHA_B));
+        assert!(cache_exists(dir.path(), SHA_C));
+    }
+
+    #[test]
+    fn test_evict_keep_file_never_evicted() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cache_file(dir.path(), SHA_A, b"AAAA", 0);
+        write_cache_file(dir.path(), SHA_B, b"BBBB", 10);
+
+        // Limit to 4 bytes, keep SHA_A → should evict SHA_B instead
+        evict_oldest(dir.path(), 4, SHA_A).unwrap();
+
+        assert!(cache_exists(dir.path(), SHA_A));
+        assert!(!cache_exists(dir.path(), SHA_B));
+    }
+
+    #[test]
+    fn test_evict_zero_max_bytes_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cache_file(dir.path(), SHA_A, b"AAAA", 0);
+
+        evict_oldest(dir.path(), 0, "none").unwrap();
+
+        assert!(cache_exists(dir.path(), SHA_A));
+    }
+
+    #[test]
+    fn test_evict_empty_cache_no_error() {
+        let dir = tempfile::tempdir().unwrap();
+
+        evict_oldest(dir.path(), 1024, "none").unwrap();
     }
 }
