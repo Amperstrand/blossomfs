@@ -320,6 +320,12 @@ pub struct MountArgs {
 
     #[arg(long, default_value_t = 1)]
     pub max_free_size_mb: u64,
+
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+
+    #[arg(long, default_value_t = false)]
+    pub daemon: bool,
 }
 
 impl Default for MountArgs {
@@ -342,6 +348,8 @@ impl Default for MountArgs {
             max_write_mb: 100,
             free_period_days: 30,
             max_free_size_mb: 1,
+            config: None,
+            daemon: false,
         }
     }
 }

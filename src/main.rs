@@ -8,6 +8,7 @@
 mod blossom;
 mod cache;
 mod cli;
+mod config;
 mod fuse;
 mod git;
 mod nostr;
@@ -16,7 +17,7 @@ mod util;
 use std::path::Path;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use fuser::MountOption;
 
 use crate::blossom::client::BlossomClient;
@@ -121,10 +122,41 @@ fn main() {
         )
         .init();
 
-    let cli = Cli::parse();
+    let cmd = Cli::command();
+    let matches = cmd.get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(c) => c,
+        Err(e) => e.exit(),
+    };
 
     match cli.command {
-        Command::Mount(args) => {
+        Command::Mount(mut args) => {
+            if let Some(ref config_path) = args.config {
+                match config::BlossomConfig::load(config_path) {
+                    Ok(cfg) => {
+                        let mount_matches = matches.subcommand_matches("mount");
+                        cfg.merge_into(&mut args, |name| {
+                            mount_matches
+                                .and_then(|m| m.value_source(name))
+                                .map(|s| s == clap::parser::ValueSource::CommandLine)
+                                .unwrap_or(false)
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("blossomfs: config error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            if args.daemon {
+                tracing::info!("forking to background (daemon mode)");
+                if let Err(e) = daemonize::Daemonize::new().start() {
+                    eprintln!("blossomfs: daemonize failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+
             if let Err(e) = run_mount(args) {
                 eprintln!("blossomfs: error: {e}");
                 std::process::exit(1);
