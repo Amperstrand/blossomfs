@@ -6,46 +6,33 @@
 
 use mime_guess::mime;
 
-/// Infer file extension from MIME type using mime_guess crate.
-///
-/// Returns Some(extension) for known MIME types, None for octet-stream or unknown.
-#[allow(dead_code)]
-fn preferred_extension(mime_type: &str) -> Option<String> {
+fn preferred_extension(mime_type: &str) -> Option<&'static str> {
     match mime_type {
-        "text/plain" => Some("txt".to_string()),
-        "text/html" => Some("html".to_string()),
-        "text/css" => Some("css".to_string()),
-        "text/javascript" | "application/javascript" => Some("js".to_string()),
-        "application/json" => Some("json".to_string()),
-        "application/xml" | "text/xml" => Some("xml".to_string()),
-        "image/jpeg" => Some("jpg".to_string()),
-        "image/svg+xml" => Some("svg".to_string()),
-        "audio/mpeg" => Some("mp3".to_string()),
-        "video/mp4" => Some("mp4".to_string()),
-        "video/webm" => Some("webm".to_string()),
-        "application/zip" => Some("zip".to_string()),
-        "application/gzip" => Some("gz".to_string()),
-        "application/x-tar" => Some("tar".to_string()),
+        "image/jpeg" => Some("jpg"),
+        "text/plain" => Some("txt"),
         _ => None,
     }
 }
 
+/// Infer file extension from a MIME type string using the `mime_guess` crate,
+/// with a small override for common types where the crate's first result is
+/// non-conventional (e.g. "jfif" for image/jpeg).
 pub fn mime_to_extension(mime_type: &str) -> Option<String> {
     if mime_type.is_empty() {
         return None;
     }
 
     if let Some(ext) = preferred_extension(mime_type) {
-        return Some(ext);
+        return Some(ext.to_string());
     }
 
-    let mime_type: mime::Mime = mime_type.parse().ok()?;
+    let parsed: mime::Mime = mime_type.parse().ok()?;
 
-    if mime_type.type_() == mime::APPLICATION && mime_type.subtype() == mime::OCTET_STREAM {
+    if parsed.type_() == mime::APPLICATION && parsed.subtype() == mime::OCTET_STREAM {
         return None;
     }
 
-    mime_guess::get_mime_extensions(&mime_type)
+    mime_guess::get_mime_extensions(&parsed)
         .and_then(|exts| exts.first())
         .map(|s| s.to_string())
 }
@@ -123,9 +110,7 @@ mod tests {
 
     #[test]
     fn test_mime_to_extension_jpeg() {
-        let ext = mime_to_extension("image/jpeg");
-        assert!(ext.is_some());
-        assert_eq!(ext.unwrap(), "jpg");
+        assert_eq!(mime_to_extension("image/jpeg"), Some("jpg".to_string()));
     }
 
     #[test]

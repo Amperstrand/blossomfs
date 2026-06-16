@@ -10,20 +10,16 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-test:
+  lint:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y fuse3 libfuse3-dev pkg-config build-essential
-
-      - name: Load FUSE kernel module
-        run: sudo modprobe fuse || true
+          sudo apt-get install -y fuse3 libfuse3-dev pkg-config build-essential libgit2-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -38,6 +34,27 @@ jobs:
 
       - name: Clippy
         run: cargo clippy -- -D warnings
+
+  integration-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev pkg-config build-essential libgit2-dev
+
+      - name: Load FUSE kernel module
+        run: sudo modprobe fuse || true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
 
       - name: Unit tests
         run: cargo test

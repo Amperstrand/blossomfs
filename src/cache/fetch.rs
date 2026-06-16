@@ -8,14 +8,16 @@
 
 #![allow(dead_code)]
 
+use std::io::Write;
 use std::path::Path;
 
+use backon::{ExponentialBuilder, Retryable};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::blossom::descriptor::MAX_BLOB_SIZE;
 use crate::cache::object_cache::{
-    CacheError, cache_exists, cache_path, ensure_cache_dir, read_cached, temp_path,
+    CacheError, cache_exists, cache_path, ensure_cache_dir, read_cached,
 };
 
 #[derive(Error, Debug)]
@@ -56,12 +58,23 @@ pub async fn fetch_and_cache(
             .map_err(FetchError::Cache);
     }
 
-    // 2a. Download — error_for_status converts 4xx/5xx into Err
+    // 2a. Download with retry — exponential backoff on transient failures.
     //     Redirect policy: none (security — never follow redirects from blob servers)
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
-    let resp = client.get(url).send().await?.error_for_status()?;
+
+    let resp = (|| async { client.get(url).send().await?.error_for_status() })
+        .retry(ExponentialBuilder::default())
+        .sleep(tokio::time::sleep)
+        .when(|e: &reqwest::Error| {
+            e.is_connect()
+                || e.is_timeout()
+                || e.status()
+                    .map(|s| s.is_server_error() || s.as_u16() == 429)
+                    .unwrap_or(false)
+        })
+        .await?;
 
     // Size guard: reject responses larger than MAX_BLOB_SIZE to prevent OOM
     if let Some(len) = resp.content_length()
@@ -105,25 +118,15 @@ pub async fn fetch_and_cache(
         });
     }
 
-    // 2e. Ensure cache directory exists for this hash
+    // 2e. Atomic write via NamedTempFile::persist (POSIX rename is atomic on same fs)
     ensure_cache_dir(cache_base, expected_sha256)?;
-
-    // Write to temp file, then atomic rename (POSIX rename is atomic on same filesystem)
     let cache_file = cache_path(cache_base, expected_sha256)?;
-    let temp = temp_path(cache_base, expected_sha256);
+    let tmp_dir = cache_base.join(".tmp");
+    std::fs::create_dir_all(&tmp_dir)?;
 
-    // Ensure .tmp directory exists
-    if let Some(parent) = temp.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    std::fs::write(&temp, bytes.as_ref())?;
-
-    // Atomic rename — if it fails, clean up the temp file
-    if let Err(e) = std::fs::rename(&temp, &cache_file) {
-        let _ = std::fs::remove_file(&temp); // Best-effort cleanup
-        return Err(e.into());
-    }
+    let mut temp = tempfile::NamedTempFile::new_in(&tmp_dir)?;
+    temp.write_all(bytes.as_ref())?;
+    temp.persist(&cache_file).map_err(|e| e.error)?;
 
     Ok((bytes.to_vec(), sunset_ts))
 }

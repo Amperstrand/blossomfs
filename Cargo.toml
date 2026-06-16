@@ -55,12 +55,27 @@ toml = "0.8"
 # Daemon mode (fork to background)
 daemonize = "0.5"
 
+# HTTP retry with exponential backoff
+backon = "1"
+
+# Atomic file writes (NamedTempFile::persist)
+tempfile = "3"
+
+# systemd notification (READY/STOPPING signals)
+sd-notify = "0.5"
+
+# Native git operations (no external git binary needed)
+git2 = "0.19"
+
+# Robust directory traversal
+walkdir = "2"
+
 [dev-dependencies]
 reqwest = "0.13"
-tempfile = "3"
 wiremock = "0.6"
 tokio = { version = "1", features = ["test-util", "full"] }
 
 [profile.release]
 opt-level = 3
 lto = true
+strip = true

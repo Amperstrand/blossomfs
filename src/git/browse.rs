@@ -2,19 +2,16 @@
 //!
 //! At mount time, NIP-34 repo directories are marked as lazy.
 //! On first `readdir` into a repo directory, [`clone_repo`] fetches
-//! the repo with `git clone --depth 1` (only the latest commit —
-//! minimal bandwidth, one HTTP request per repo). Then
-//! [`walk_repo_tree`] recursively adds all files and directories
-//! to the virtual [`Tree`] so they become browseable through FUSE.
+//! the repo via `git2` (native Rust — no external git binary needed).
+//! Then [`walk_repo_tree`] uses `walkdir` to add all files and
+//! directories to the virtual [`Tree`].
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 use crate::fuse::tree::Tree;
 
 #[derive(Debug)]
 pub enum CloneError {
-    CommandFailed(String),
     GitFailed(String),
     AlreadyExists,
 }
@@ -22,7 +19,6 @@ pub enum CloneError {
 impl std::fmt::Display for CloneError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CloneError::CommandFailed(msg) => write!(f, "git command failed: {}", msg),
             CloneError::GitFailed(msg) => write!(f, "git error: {}", msg),
             CloneError::AlreadyExists => write!(f, "destination already exists"),
         }
@@ -31,9 +27,9 @@ impl std::fmt::Display for CloneError {
 
 impl std::error::Error for CloneError {}
 
-/// Clone a git repository with `--depth 1` (shallow, latest commit only).
+/// Clone a git repository using `git2` (native, no external binary).
 ///
-/// Skips the clone if `dest` already exists (cached from a previous mount).
+/// Skips the clone if `dest` already exists with a `.git` dir (cached).
 pub fn clone_repo(url: &str, dest: &Path) -> Result<(), CloneError> {
     if dest.exists() && dest.join(".git").exists() {
         tracing::info!("repo already cached at {:?}", dest);
@@ -46,89 +42,61 @@ pub fn clone_repo(url: &str, dest: &Path) -> Result<(), CloneError> {
 
     tracing::info!("cloning {} → {:?}", url, dest);
 
-    let output = Command::new("git")
-        .args([
-            "clone",
-            "--depth",
-            "1",
-            "--single-branch",
-            "--no-tags",
-            url,
-            dest.to_str().ok_or_else(|| {
-                CloneError::CommandFailed("non-UTF-8 destination path".to_string())
-            })?,
-        ])
-        .output()
-        .map_err(|e| CloneError::CommandFailed(e.to_string()))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(CloneError::GitFailed(stderr.to_string()));
-    }
+    git2::build::RepoBuilder::new()
+        .clone(url, dest)
+        .map_err(|e| CloneError::GitFailed(e.message().to_string()))?;
 
     Ok(())
 }
 
-/// Recursively walk a cloned repo directory and add all files/dirs to the
-/// FUSE tree under `parent_ino`. Skips the `.git` directory.
+/// Walk a cloned repo directory and add all files/dirs to the FUSE tree
+/// under `parent_ino`. Skips the `.git` directory. Uses `walkdir` for
+/// robust traversal with sorted output.
 pub fn walk_repo_tree(repo_path: &Path, tree: &mut Tree, parent_ino: u64) -> usize {
+    use std::collections::HashMap;
+
+    let mut path_to_ino: HashMap<std::path::PathBuf, u64> = HashMap::new();
+    path_to_ino.insert(repo_path.to_path_buf(), parent_ino);
     let mut count = 0;
-    walk_dir_recursive(repo_path, tree, parent_ino, &mut count);
-    count
-}
 
-fn walk_dir_recursive(dir: &Path, tree: &mut Tree, parent_ino: u64, count: &mut usize) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!("failed to read dir {:?}: {}", dir, e);
-            return;
-        }
-    };
-
-    let mut subdirs: Vec<(String, PathBuf)> = Vec::new();
-    let mut files: Vec<(String, PathBuf, u64)> = Vec::new();
-
-    for entry in entries {
+    for entry in walkdir::WalkDir::new(repo_path)
+        .min_depth(1)
+        .sort_by(|a, b| a.file_name().cmp(b.file_name()))
+        .into_iter()
+        .filter_entry(|e| {
+            let rel = e.path().strip_prefix(repo_path).unwrap_or(e.path());
+            !rel.starts_with(".git")
+        })
+    {
         let entry = match entry {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::warn!("walkdir error: {}", e);
+                continue;
+            }
         };
 
-        let name = entry.file_name();
-        let name_str = match name.to_str() {
-            Some(s) => s,
+        let name = match entry.file_name().to_str() {
+            Some(s) => s.to_string(),
             None => continue,
         };
 
-        if name_str == ".git" {
-            continue;
-        }
-
-        let path = entry.path();
-        let metadata = match std::fs::metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
+        let parent_path = entry.path().parent().unwrap();
+        let p_ino = match path_to_ino.get(parent_path) {
+            Some(&ino) => ino,
+            None => continue,
         };
 
-        if metadata.is_dir() {
-            subdirs.push((name_str.to_string(), path));
-        } else if metadata.is_file() {
-            files.push((name_str.to_string(), path, metadata.len()));
+        if entry.file_type().is_dir() {
+            let dir_ino = tree.add_directory(p_ino, &name);
+            path_to_ino.insert(entry.path().to_path_buf(), dir_ino);
+            count += 1;
+        } else if entry.file_type().is_file() {
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            tree.add_local_file(p_ino, &name, entry.path().to_path_buf(), size);
+            count += 1;
         }
     }
 
-    subdirs.sort_by(|a, b| a.0.cmp(&b.0));
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-
-    for (name, path) in subdirs {
-        let dir_ino = tree.add_directory(parent_ino, &name);
-        *count += 1;
-        walk_dir_recursive(&path, tree, dir_ino, count);
-    }
-
-    for (name, path, size) in files {
-        tree.add_local_file(parent_ino, &name, path, size);
-        *count += 1;
-    }
+    count
 }

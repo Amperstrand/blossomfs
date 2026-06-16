@@ -1,7 +1,7 @@
 FROM ubuntu:24.04 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    fuse3 libfuse3-dev pkg-config build-essential ca-certificates curl \
+    fuse3 libfuse3-dev pkg-config build-essential ca-certificates curl libgit2-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable

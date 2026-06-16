@@ -70,20 +70,6 @@ pub fn read_cached(base: &Path, sha256: &str) -> Result<Vec<u8>, CacheError> {
     Ok(content)
 }
 
-/// Compute the temp file path for downloading (before atomic rename)
-/// Layout: <base>/.tmp/<sha256_prefix>_<timestamp>_<pid>
-pub fn temp_path(base: &Path, sha256: &str) -> PathBuf {
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let pid = std::process::id();
-    let prefix = &sha256[..8.min(sha256.len())];
-    let name = format!("{}_{}_{}", prefix, timestamp, pid);
-
-    base.join(".tmp").join(name)
-}
-
 /// Ensure the cache directory structure exists for a given sha256.
 /// Creates <base>/objects/<aa>/<bb>/ if needed.
 pub fn ensure_cache_dir(base: &Path, sha256: &str) -> Result<PathBuf, CacheError> {
@@ -195,16 +181,6 @@ mod tests {
         assert!(result.is_ok());
         let read_content = result.unwrap();
         assert_eq!(read_content, content.to_vec());
-    }
-
-    #[test]
-    fn test_temp_path() {
-        let base = Path::new("/cache");
-        let path = temp_path(base, VALID_HASH);
-        assert!(path.starts_with(base.join(".tmp")));
-        let path_str = path.to_str().unwrap();
-        assert!(path_str.contains(".tmp/"));
-        assert!(path_str.contains("abcdef12"));
     }
 
     #[test]

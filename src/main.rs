@@ -559,7 +559,12 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
     options.mount_options = mount_opts;
 
     tracing::info!("mounting FUSE filesystem...");
+
+    let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
+
     fuser::mount2(fs, &args.mountpoint, &options)?;
+
+    let _ = sd_notify::notify(&[sd_notify::NotifyState::Stopping]);
 
     // rt stays alive until here — dropped after mount2 returns (after unmount)
     drop(rt);
