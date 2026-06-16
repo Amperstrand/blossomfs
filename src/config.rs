@@ -1,9 +1,30 @@
-use serde::Deserialize;
+use figment::Figment;
+use figment::providers::{Env, Format, Toml};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::cli;
 
-#[derive(Debug, Default, Deserialize)]
+const ENV_FIELDS: &[&str] = &[
+    "npub",
+    "pubkey",
+    "server",
+    "manifest",
+    "cache_dir",
+    "read_only",
+    "nsec_file",
+    "relay",
+    "nip34_relay",
+    "nip34_pubkey",
+    "nip34_clone",
+    "ttl_secs",
+    "max_write_mb",
+    "free_period_days",
+    "max_free_size_mb",
+    "max_cache_size",
+];
+
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlossomConfig {
     pub npub: Option<String>,
@@ -33,6 +54,8 @@ pub enum ConfigError {
     Read(String, #[source] std::io::Error),
     #[error("failed to parse config file {0}: {1}")]
     Parse(String, #[source] toml::de::Error),
+    #[error("configuration error: {0}")]
+    Figment(String),
 }
 
 impl BlossomConfig {
@@ -40,6 +63,27 @@ impl BlossomConfig {
         let content = std::fs::read_to_string(path)
             .map_err(|e| ConfigError::Read(path.display().to_string(), e))?;
         toml::from_str(&content).map_err(|e| ConfigError::Parse(path.display().to_string(), e))
+    }
+
+    pub fn load_merged(
+        config_path: Option<&Path>,
+        args: &mut cli::MountArgs,
+        is_explicit: impl Fn(&str) -> bool,
+    ) -> Result<(), ConfigError> {
+        let mut figment = Figment::new();
+
+        if let Some(path) = config_path {
+            figment = figment.merge(Toml::file(path));
+        }
+
+        figment = figment.merge(Env::prefixed("BLOSSOMFS_").only(ENV_FIELDS));
+
+        let config: BlossomConfig = figment
+            .extract()
+            .map_err(|e| ConfigError::Figment(e.to_string()))?;
+
+        config.merge_into(args, is_explicit);
+        Ok(())
     }
 
     pub fn merge_into<F>(&self, args: &mut cli::MountArgs, is_explicit: F)
@@ -281,5 +325,44 @@ read_only = false
         assert_eq!(args.max_write_mb, 200);
         assert_eq!(args.free_period_days, 60);
         assert_eq!(args.max_free_size_mb, 5);
+    }
+
+    #[test]
+    fn s13_config_env_var_override() {
+        unsafe {
+            std::env::set_var("BLOSSOMFS_TTL_SECS", "99");
+        }
+        let mut args = default_args();
+        BlossomConfig::load_merged(None, &mut args, |_| false).unwrap();
+        unsafe {
+            std::env::remove_var("BLOSSOMFS_TTL_SECS");
+        }
+        assert_eq!(args.ttl_secs, 99);
+    }
+
+    #[test]
+    fn s14_config_env_var_npub() {
+        unsafe {
+            std::env::set_var("BLOSSOMFS_NPUB", "npub1envtest");
+        }
+        let mut args = default_args();
+        BlossomConfig::load_merged(None, &mut args, |_| false).unwrap();
+        unsafe {
+            std::env::remove_var("BLOSSOMFS_NPUB");
+        }
+        assert_eq!(args.npub.as_deref(), Some("npub1envtest"));
+    }
+
+    #[test]
+    fn s15_config_cli_overrides_env() {
+        unsafe {
+            std::env::set_var("BLOSSOMFS_TTL_SECS", "99");
+        }
+        let mut args = default_args();
+        BlossomConfig::load_merged(None, &mut args, |_| true).unwrap();
+        unsafe {
+            std::env::remove_var("BLOSSOMFS_TTL_SECS");
+        }
+        assert_ne!(args.ttl_secs, 99);
     }
 }

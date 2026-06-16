@@ -150,6 +150,19 @@ nip34_pubkey = "npub1..."
 nip34_clone = false
 ```
 
+All config fields are optional. Precedence: **CLI args > environment variables > config file > defaults**.
+
+### Environment Variables
+
+Any config field can also be set via environment variables with the `BLOSSOMFS_` prefix. Environment variables override the config file but are overridden by CLI arguments.
+
+```bash
+BLOSSOMFS_CACHE_DIR=/var/cache/blossomfs \
+BLOSSOMFS_TTL_SECS=3600 \
+BLOSSOMFS_NPUB=npub1... \
+./target/release/blossomfs mount --mountpoint /mnt/blossom
+```
+
 Then mount with just the mountpoint and config:
 
 ```bash

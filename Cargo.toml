@@ -49,7 +49,8 @@ httpdate = "1"
 # TLS provider for nostr-sdk WebSocket connections (rustls 0.23 requires explicit provider)
 rustls = { version = "0.23", features = ["ring"] }
 
-# Config file parsing
+# Config file parsing (figment for hierarchical config: CLI > env > file)
+figment = { version = "0.10", features = ["toml", "env"] }
 toml = "0.8"
 
 # Daemon mode (fork to background)

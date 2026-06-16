@@ -131,22 +131,20 @@ fn main() {
 
     match cli.command {
         Command::Mount(mut args) => {
-            if let Some(ref config_path) = args.config {
-                match config::BlossomConfig::load(config_path) {
-                    Ok(cfg) => {
-                        let mount_matches = matches.subcommand_matches("mount");
-                        cfg.merge_into(&mut args, |name| {
-                            mount_matches
-                                .and_then(|m| m.value_source(name))
-                                .map(|s| s == clap::parser::ValueSource::CommandLine)
-                                .unwrap_or(false)
-                        });
-                    }
-                    Err(e) => {
-                        eprintln!("blossomfs: config error: {e}");
-                        std::process::exit(1);
-                    }
-                }
+            let mount_matches = matches.subcommand_matches("mount");
+            let is_explicit = |name: &str| {
+                mount_matches
+                    .and_then(|m| m.value_source(name))
+                    .map(|s| s == clap::parser::ValueSource::CommandLine)
+                    .unwrap_or(false)
+            };
+
+            let config_path = args.config.clone();
+            if let Err(e) =
+                config::BlossomConfig::load_merged(config_path.as_deref(), &mut args, is_explicit)
+            {
+                eprintln!("blossomfs: config error: {e}");
+                std::process::exit(1);
             }
 
             if args.daemon {
