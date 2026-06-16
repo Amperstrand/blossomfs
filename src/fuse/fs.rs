@@ -84,6 +84,7 @@ pub struct BlossomFS {
     fetch_in_progress: Arc<(Mutex<HashSet<String>>, Condvar)>,
     /// When true, all write operations return EROFS even in RW mode.
     frozen: Arc<AtomicBool>,
+    payment: Arc<dyn crate::payment::PaymentStrategy>,
 }
 
 impl BlossomFS {
@@ -105,6 +106,7 @@ impl BlossomFS {
             max_cache_bytes: 0,
             fetch_in_progress: Arc::new((Mutex::new(HashSet::new()), Condvar::new())),
             frozen: Arc::new(AtomicBool::new(false)),
+            payment: Arc::new(crate::payment::NoPayment),
         }
     }
 
@@ -139,6 +141,7 @@ impl BlossomFS {
             max_cache_bytes,
             fetch_in_progress: Arc::new((Mutex::new(HashSet::new()), Condvar::new())),
             frozen: Arc::new(AtomicBool::new(false)),
+            payment: Arc::new(crate::payment::NoPayment),
         }
     }
 
@@ -159,6 +162,7 @@ impl BlossomFS {
         free_period_secs: u64,
         max_free_size_bytes: usize,
         max_cache_bytes: u64,
+        payment: Arc<dyn crate::payment::PaymentStrategy>,
     ) -> Self {
         Self {
             tree: Arc::new(RwLock::new(tree)),
@@ -176,6 +180,7 @@ impl BlossomFS {
             max_cache_bytes,
             fetch_in_progress: Arc::new((Mutex::new(HashSet::new()), Condvar::new())),
             frozen: Arc::new(AtomicBool::new(false)),
+            payment,
         }
     }
 
@@ -505,6 +510,7 @@ impl BlossomFS {
             &client,
             &data,
             &auth_header,
+            self.payment.as_ref(),
             MAX_ATTEMPTS,
         )) {
             Ok(desc) => {
@@ -565,6 +571,13 @@ fn is_retryable_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
+fn xattr_enodata() -> Errno {
+    #[cfg(target_os = "linux")]
+    { Errno::ENODATA }
+    #[cfg(not(target_os = "linux"))]
+    { Errno::ENOTSUP }
+}
+
 /// Upload a blob with retry on transient failures.
 ///
 /// Retries up to `max_attempts` times with exponential backoff (1 s, 2 s, …)
@@ -576,16 +589,19 @@ async fn upload_with_retry(
     client: &BlossomClient,
     data: &[u8],
     auth_header: &str,
+    payment: &dyn crate::payment::PaymentStrategy,
     max_attempts: u32,
 ) -> Result<BlobDescriptor, BlossomClientError> {
     for attempt in 1..=max_attempts {
-        match client.upload_blob(data.to_vec(), auth_header).await {
+        match client.upload_blob_with_payment(data.to_vec(), auth_header, payment).await {
             Ok(desc) => return Ok(desc),
             Err(e) => {
                 let retry = match &e {
                     BlossomClientError::ServerError { status, .. } => {
                         is_retryable_status(*status) && attempt < max_attempts
                     }
+                    BlossomClientError::PaymentRequired { .. }
+                    | BlossomClientError::Payment(_) => false,
                     _ => attempt < max_attempts,
                 };
 
@@ -1301,12 +1317,12 @@ impl Filesystem for BlossomFS {
 
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         if name != OsStr::new("user.blossom.expiry") {
-            reply.error(Errno::ENODATA);
+            reply.error(xattr_enodata());
             return;
         }
 
         let Some(ts) = self.compute_effective_expiry(ino.into()) else {
-            reply.error(Errno::ENODATA);
+            reply.error(xattr_enodata());
             return;
         };
 
@@ -1911,6 +1927,7 @@ mod tests {
             30 * 86400,
             1024 * 1024,
             0,
+            Arc::new(crate::payment::NoPayment),
         );
         (rt, fs)
     }
@@ -2283,7 +2300,7 @@ mod tests {
             .await;
 
         let client = BlossomClient::new(mock_server.uri());
-        let result = upload_with_retry(&client, b"test data", "tok", 3).await;
+        let result = upload_with_retry(&client, b"test data", "tok", &crate::payment::NoPayment, 3).await;
 
         assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
         let desc = result.unwrap();
@@ -2316,7 +2333,7 @@ mod tests {
             .await;
 
         let client = BlossomClient::new(mock_server.uri());
-        let result = upload_with_retry(&client, b"test data", "tok", 3).await;
+        let result = upload_with_retry(&client, b"test data", "tok", &crate::payment::NoPayment, 3).await;
 
         assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
     }
@@ -2346,7 +2363,7 @@ mod tests {
             .await;
 
         let client = BlossomClient::new(mock_server.uri());
-        let result = upload_with_retry(&client, b"test data", "tok", 3).await;
+        let result = upload_with_retry(&client, b"test data", "tok", &crate::payment::NoPayment, 3).await;
 
         assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
     }
@@ -2368,7 +2385,7 @@ mod tests {
             .await;
 
         let client = BlossomClient::new(mock_server.uri());
-        let result = upload_with_retry(&client, b"test data", "tok", 3).await;
+        let result = upload_with_retry(&client, b"test data", "tok", &crate::payment::NoPayment, 3).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2396,14 +2413,12 @@ mod tests {
             .await;
 
         let client = BlossomClient::new(mock_server.uri());
-        let result = upload_with_retry(&client, b"test data", "tok", 3).await;
+        let result = upload_with_retry(&client, b"test data", "tok", &crate::payment::NoPayment, 3).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            BlossomClientError::ServerError { status, .. } => {
-                assert_eq!(status, 402);
-            }
-            other => panic!("expected ServerError, got {other:?}"),
+            BlossomClientError::Payment(_) => { /* expected: no payment configured */ }
+            other => panic!("expected Payment error, got {other:?}"),
         }
     }
 
@@ -2424,7 +2439,7 @@ mod tests {
             .await;
 
         let client = BlossomClient::new(mock_server.uri());
-        let result = upload_with_retry(&client, b"test data", "tok", 3).await;
+        let result = upload_with_retry(&client, b"test data", "tok", &crate::payment::NoPayment, 3).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2452,7 +2467,7 @@ mod tests {
             .await;
 
         let client = BlossomClient::new(mock_server.uri());
-        let result = upload_with_retry(&client, b"test data", "tok", 3).await;
+        let result = upload_with_retry(&client, b"test data", "tok", &crate::payment::NoPayment, 3).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {

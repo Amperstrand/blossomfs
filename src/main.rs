@@ -13,9 +13,11 @@ mod control;
 mod fuse;
 mod git;
 mod nostr;
+mod payment;
 mod util;
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{CommandFactory, FromArgMatches};
@@ -23,6 +25,7 @@ use fuser::MountOption;
 
 use crate::blossom::client::BlossomClient;
 use crate::blossom::descriptor::BlobDescriptor;
+use crate::payment::PaymentStrategy;
 use crate::blossom::manifest::load_manifest;
 use crate::cli::{Cli, Command};
 use crate::fuse::fs::BlossomFS;
@@ -163,7 +166,48 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Command::Extend(args) => {
+            if let Err(e) = run_extend(args) {
+                eprintln!("blossomfs: error: {e}");
+                std::process::exit(1);
+            }
+        }
     }
+}
+
+fn run_extend(args: cli::ExtendArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let keys = if let Some(ref path) = args.nsec_file {
+        crate::nostr::keys::read_nsec_file(path)?
+    } else {
+        return Err("extend requires --nsec-file".into());
+    };
+
+    let auth_header = crate::nostr::auth::create_upload_auth_header(&keys, &args.sha256, 0)?;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let client = BlossomClient::new(args.server.clone());
+
+        let payment: Box<dyn PaymentStrategy> = if let Some(ref path) = args.cashu_token_file {
+            let token = std::fs::read_to_string(path)?.trim().to_string();
+            Box::new(crate::payment::TokenStrategy::new(token))
+        } else if let Some(ref uri) = args.nwc_uri {
+            match crate::payment::NwcStrategy::new(uri) {
+                Ok(s) => Box::new(s),
+                Err(e) => return Err(format!("invalid NWC URI: {e}").into()),
+            }
+        } else {
+            return Err("extend requires --cashu-token-file or --nwc-uri".into());
+        };
+
+        match client.extend_blob_with_payment(&args.sha256, &auth_header, payment.as_ref()).await {
+            Ok(desc) => {
+                println!("extended: {} ({} bytes)", desc.sha256, desc.size);
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    })
 }
 
 fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -557,6 +601,26 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let server_url = effective_servers.first().cloned();
 
+    let payment: Arc<dyn PaymentStrategy> = if let Some(ref path) = args.cashu_token_file {
+        match std::fs::read_to_string(path) {
+            Ok(token) => Arc::new(crate::payment::TokenStrategy::new(token.trim().to_string())),
+            Err(e) => {
+                tracing::warn!("failed to read cashu token file: {}", e);
+                Arc::new(crate::payment::NoPayment)
+            }
+        }
+    } else if let Some(ref uri) = args.nwc_uri {
+        match crate::payment::NwcStrategy::new(uri) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                tracing::warn!("failed to parse NWC URI: {}", e);
+                Arc::new(crate::payment::NoPayment)
+            }
+        }
+    } else {
+        Arc::new(crate::payment::NoPayment)
+    };
+
     // Create filesystem with appropriate constructor
     let handle = rt.handle().clone();
     let (fs, is_rw) = match (keys, server_url, args.read_only) {
@@ -574,6 +638,7 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
                     args.free_period_days * 86400,
                     (args.max_free_size_mb as usize) * 1024 * 1024,
                     args.max_cache_size * 1024 * 1024,
+                    payment,
                 ),
                 true,
             )

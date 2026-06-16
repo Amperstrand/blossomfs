@@ -11,6 +11,7 @@
 use thiserror::Error;
 
 use crate::blossom::descriptor::BlobDescriptor;
+use crate::payment::PaymentStrategy;
 
 #[derive(Error, Debug)]
 pub enum BlossomClientError {
@@ -22,6 +23,10 @@ pub enum BlossomClientError {
     ServerError { status: u16, body: String },
     #[error("sha256 mismatch: expected {expected}, got {actual}")]
     HashMismatch { expected: String, actual: String },
+    #[error("payment required: X-Cashu={x_cashu}")]
+    PaymentRequired { x_cashu: String },
+    #[error("payment error: {0}")]
+    Payment(#[from] crate::payment::PaymentError),
 }
 
 /// Response from BUD-12 list endpoint.
@@ -255,6 +260,111 @@ impl BlossomClient {
         }
 
         Ok(())
+    }
+
+    async fn upload_attempt(
+        &self,
+        data: &[u8],
+        auth_header: &str,
+        payment_token: Option<&str>,
+    ) -> Result<BlobDescriptor, BlossomClientError> {
+        let url = format!("{}/upload", self.base_url);
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let sha256_hex = format!("{:x}", hasher.finalize());
+
+        let mut req = self.client.put(&url)
+            .header("Authorization", format!("Nostr {auth_header}"))
+            .header("Content-Type", "application/octet-stream")
+            .header("X-SHA-256", &sha256_hex);
+
+        if let Some(token) = payment_token {
+            req = req.header("X-Cashu", token);
+        }
+
+        let response = req.body(data.to_vec()).send().await?;
+        let status = response.status();
+
+        if status.is_success() {
+            let body = response.text().await?;
+            return Ok(serde_json::from_str(&body)?);
+        }
+
+        if status.as_u16() == 402 {
+            let x_cashu = response.headers().get("x-cashu")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default().to_string();
+            return Err(BlossomClientError::PaymentRequired { x_cashu });
+        }
+
+        let body = response.text().await.unwrap_or_default();
+        Err(BlossomClientError::ServerError { status: status.as_u16(), body })
+    }
+
+    pub async fn upload_blob_with_payment(
+        &self,
+        data: Vec<u8>,
+        auth_header: &str,
+        payment: &dyn PaymentStrategy,
+    ) -> Result<BlobDescriptor, BlossomClientError> {
+        match self.upload_attempt(&data, auth_header, None).await {
+            Ok(desc) => Ok(desc),
+            Err(BlossomClientError::PaymentRequired { x_cashu }) => {
+                let payment_token = payment.pay(&x_cashu)?;
+                self.upload_attempt(&data, auth_header, Some(&payment_token)).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn extend_attempt(
+        &self,
+        sha256: &str,
+        auth_header: &str,
+        payment_token: Option<&str>,
+    ) -> Result<BlobDescriptor, BlossomClientError> {
+        let url = format!("{}/{}", self.base_url, sha256);
+        let mut req = self.client.patch(&url)
+            .header("Authorization", format!("Nostr {auth_header}"));
+
+        if let Some(token) = payment_token {
+            req = req.header("X-Cashu", token);
+        }
+
+        let response = req.send().await?;
+        let status = response.status();
+
+        if status.is_success() {
+            let body = response.text().await?;
+            return Ok(serde_json::from_str(&body)?);
+        }
+
+        if status.as_u16() == 402 {
+            let x_cashu = response.headers().get("x-cashu")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default().to_string();
+            return Err(BlossomClientError::PaymentRequired { x_cashu });
+        }
+
+        let body = response.text().await.unwrap_or_default();
+        Err(BlossomClientError::ServerError { status: status.as_u16(), body })
+    }
+
+    pub async fn extend_blob_with_payment(
+        &self,
+        sha256: &str,
+        auth_header: &str,
+        payment: &dyn PaymentStrategy,
+    ) -> Result<BlobDescriptor, BlossomClientError> {
+        match self.extend_attempt(sha256, auth_header, None).await {
+            Ok(desc) => Ok(desc),
+            Err(BlossomClientError::PaymentRequired { x_cashu }) => {
+                let payment_token = payment.pay(&x_cashu)?;
+                self.extend_attempt(sha256, auth_header, Some(&payment_token)).await
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 

@@ -15,6 +15,7 @@ mod tests {
         let cli = Cli::try_parse_from(args)?;
         match cli.command {
             Command::Mount(mount_args) => Ok(mount_args),
+            _ => panic!("expected Mount command"),
         }
     }
 
@@ -242,6 +243,22 @@ pub struct Cli {
 pub enum Command {
     /// Mount a Blossom filesystem
     Mount(MountArgs),
+
+    Extend(ExtendArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct ExtendArgs {
+    #[arg(long)]
+    pub sha256: String,
+    #[arg(long)]
+    pub server: String,
+    #[arg(long)]
+    pub nsec_file: Option<PathBuf>,
+    #[arg(long)]
+    pub cashu_token_file: Option<PathBuf>,
+    #[arg(long)]
+    pub nwc_uri: Option<String>,
 }
 
 /// Arguments for the mount subcommand
@@ -345,6 +362,12 @@ pub struct MountArgs {
 
     #[arg(long, default_value_t = false)]
     pub daemon: bool,
+
+    #[arg(long)]
+    pub cashu_token_file: Option<PathBuf>,
+
+    #[arg(long)]
+    pub nwc_uri: Option<String>,
 }
 
 impl Default for MountArgs {
@@ -372,6 +395,8 @@ impl Default for MountArgs {
             max_blobs: 1000,
             config: None,
             daemon: false,
+            cashu_token_file: None,
+            nwc_uri: None,
         }
     }
 }
