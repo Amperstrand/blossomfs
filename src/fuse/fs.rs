@@ -79,6 +79,7 @@ pub struct BlossomFS {
     free_period_secs: u64,
     max_free_size_bytes: usize,
     max_cache_bytes: u64,
+    multipart_threshold: usize,
     /// Sha256 hashes currently being fetched. Prevents duplicate HTTP
     /// downloads when multiple FUSE read() calls hit the same uncached blob.
     fetch_in_progress: Arc<(Mutex<HashSet<String>>, Condvar)>,
@@ -104,6 +105,7 @@ impl BlossomFS {
             free_period_secs: 30 * 86400,
             max_free_size_bytes: 1024 * 1024,
             max_cache_bytes: 0,
+            multipart_threshold: 50 * 1024 * 1024,
             fetch_in_progress: Arc::new((Mutex::new(HashSet::new()), Condvar::new())),
             frozen: Arc::new(AtomicBool::new(false)),
             payment: Arc::new(crate::payment::NoPayment),
@@ -139,6 +141,7 @@ impl BlossomFS {
             free_period_secs,
             max_free_size_bytes,
             max_cache_bytes,
+            multipart_threshold: 50 * 1024 * 1024,
             fetch_in_progress: Arc::new((Mutex::new(HashSet::new()), Condvar::new())),
             frozen: Arc::new(AtomicBool::new(false)),
             payment: Arc::new(crate::payment::NoPayment),
@@ -163,6 +166,7 @@ impl BlossomFS {
         max_free_size_bytes: usize,
         max_cache_bytes: u64,
         payment: Arc<dyn crate::payment::PaymentStrategy>,
+        multipart_threshold: usize,
     ) -> Self {
         Self {
             tree: Arc::new(RwLock::new(tree)),
@@ -178,6 +182,7 @@ impl BlossomFS {
             free_period_secs,
             max_free_size_bytes,
             max_cache_bytes,
+            multipart_threshold,
             fetch_in_progress: Arc::new((Mutex::new(HashSet::new()), Condvar::new())),
             frozen: Arc::new(AtomicBool::new(false)),
             payment,
@@ -506,13 +511,52 @@ impl BlossomFS {
         let client = BlossomClient::new(server_url);
         const MAX_ATTEMPTS: u32 = 3;
 
-        match handle.block_on(upload_with_retry(
-            &client,
-            &data,
-            &auth_header,
-            self.payment.as_ref(),
-            MAX_ATTEMPTS,
-        )) {
+        let result = if data_len > self.multipart_threshold {
+            tracing::info!(
+                "file {} bytes > threshold {} bytes, attempting multipart upload",
+                data_len,
+                self.multipart_threshold
+            );
+            match handle.block_on(client.upload_blob_multipart(
+                &data,
+                "application/octet-stream",
+                &auth_header,
+            )) {
+                Ok(desc) => Ok(desc),
+                Err(BlossomClientError::ServerError {
+                    status: 404 | 405, ..
+                }) => {
+                    tracing::warn!("server doesn't support multipart, falling back to single-shot");
+                    handle.block_on(upload_with_retry(
+                        &client,
+                        &data,
+                        &auth_header,
+                        self.payment.as_ref(),
+                        MAX_ATTEMPTS,
+                    ))
+                }
+                Err(e) => {
+                    tracing::warn!("multipart upload failed ({e}), falling back to single-shot");
+                    handle.block_on(upload_with_retry(
+                        &client,
+                        &data,
+                        &auth_header,
+                        self.payment.as_ref(),
+                        MAX_ATTEMPTS,
+                    ))
+                }
+            }
+        } else {
+            handle.block_on(upload_with_retry(
+                &client,
+                &data,
+                &auth_header,
+                self.payment.as_ref(),
+                MAX_ATTEMPTS,
+            ))
+        };
+
+        match result {
             Ok(desc) => {
                 tracing::info!(
                     "upload complete: {} bytes → {} (sha256={})",
@@ -573,9 +617,13 @@ fn is_retryable_status(status: u16) -> bool {
 
 fn xattr_enodata() -> Errno {
     #[cfg(target_os = "linux")]
-    { Errno::ENODATA }
+    {
+        Errno::ENODATA
+    }
     #[cfg(not(target_os = "linux"))]
-    { Errno::ENOTSUP }
+    {
+        Errno::ENOTSUP
+    }
 }
 
 /// Upload a blob with retry on transient failures.
@@ -593,15 +641,19 @@ async fn upload_with_retry(
     max_attempts: u32,
 ) -> Result<BlobDescriptor, BlossomClientError> {
     for attempt in 1..=max_attempts {
-        match client.upload_blob_with_payment(data.to_vec(), auth_header, payment).await {
+        match client
+            .upload_blob_with_payment(data.to_vec(), auth_header, payment)
+            .await
+        {
             Ok(desc) => return Ok(desc),
             Err(e) => {
                 let retry = match &e {
                     BlossomClientError::ServerError { status, .. } => {
                         is_retryable_status(*status) && attempt < max_attempts
                     }
-                    BlossomClientError::PaymentRequired { .. }
-                    | BlossomClientError::Payment(_) => false,
+                    BlossomClientError::PaymentRequired { .. } | BlossomClientError::Payment(_) => {
+                        false
+                    }
                     _ => attempt < max_attempts,
                 };
 
@@ -1928,6 +1980,7 @@ mod tests {
             1024 * 1024,
             0,
             Arc::new(crate::payment::NoPayment),
+            50 * 1024 * 1024,
         );
         (rt, fs)
     }
@@ -2300,7 +2353,8 @@ mod tests {
             .await;
 
         let client = BlossomClient::new(mock_server.uri());
-        let result = upload_with_retry(&client, b"test data", "tok", &crate::payment::NoPayment, 3).await;
+        let result =
+            upload_with_retry(&client, b"test data", "tok", &crate::payment::NoPayment, 3).await;
 
         assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
         let desc = result.unwrap();
@@ -2333,7 +2387,8 @@ mod tests {
             .await;
 
         let client = BlossomClient::new(mock_server.uri());
-        let result = upload_with_retry(&client, b"test data", "tok", &crate::payment::NoPayment, 3).await;
+        let result =
+            upload_with_retry(&client, b"test data", "tok", &crate::payment::NoPayment, 3).await;
 
         assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
     }
@@ -2363,7 +2418,8 @@ mod tests {
             .await;
 
         let client = BlossomClient::new(mock_server.uri());
-        let result = upload_with_retry(&client, b"test data", "tok", &crate::payment::NoPayment, 3).await;
+        let result =
+            upload_with_retry(&client, b"test data", "tok", &crate::payment::NoPayment, 3).await;
 
         assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
     }
@@ -2385,7 +2441,8 @@ mod tests {
             .await;
 
         let client = BlossomClient::new(mock_server.uri());
-        let result = upload_with_retry(&client, b"test data", "tok", &crate::payment::NoPayment, 3).await;
+        let result =
+            upload_with_retry(&client, b"test data", "tok", &crate::payment::NoPayment, 3).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2413,7 +2470,8 @@ mod tests {
             .await;
 
         let client = BlossomClient::new(mock_server.uri());
-        let result = upload_with_retry(&client, b"test data", "tok", &crate::payment::NoPayment, 3).await;
+        let result =
+            upload_with_retry(&client, b"test data", "tok", &crate::payment::NoPayment, 3).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2439,7 +2497,8 @@ mod tests {
             .await;
 
         let client = BlossomClient::new(mock_server.uri());
-        let result = upload_with_retry(&client, b"test data", "tok", &crate::payment::NoPayment, 3).await;
+        let result =
+            upload_with_retry(&client, b"test data", "tok", &crate::payment::NoPayment, 3).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2467,7 +2526,8 @@ mod tests {
             .await;
 
         let client = BlossomClient::new(mock_server.uri());
-        let result = upload_with_retry(&client, b"test data", "tok", &crate::payment::NoPayment, 3).await;
+        let result =
+            upload_with_retry(&client, b"test data", "tok", &crate::payment::NoPayment, 3).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {

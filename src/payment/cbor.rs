@@ -15,7 +15,10 @@ pub enum CborError {
     #[error("missing field: {0}")]
     MissingField(&'static str),
     #[error("type mismatch for field {field}: expected {expected}")]
-    TypeMismatch { field: &'static str, expected: &'static str },
+    TypeMismatch {
+        field: &'static str,
+        expected: &'static str,
+    },
 }
 
 pub const CREQ_PREFIX: &str = "creqA";
@@ -60,12 +63,10 @@ fn decode_b64url(data: &str) -> Result<Vec<u8>, CborError> {
 
 fn value_as_u64(v: &ciborium::Value, field: &'static str) -> Result<u64, CborError> {
     match v {
-        ciborium::Value::Integer(i) => {
-            u64::try_from(*i).map_err(|_| CborError::TypeMismatch {
-                field,
-                expected: "non-negative integer",
-            })
-        }
+        ciborium::Value::Integer(i) => u64::try_from(*i).map_err(|_| CborError::TypeMismatch {
+            field,
+            expected: "non-negative integer",
+        }),
         _ => Err(CborError::TypeMismatch {
             field,
             expected: "integer",
@@ -117,7 +118,12 @@ pub fn decode_creq(token: &str) -> Result<Nut18Request, CborError> {
 
     let map = match &value {
         ciborium::Value::Map(m) => m,
-        _ => return Err(CborError::TypeMismatch { field: "root", expected: "map" }),
+        _ => {
+            return Err(CborError::TypeMismatch {
+                field: "root",
+                expected: "map",
+            });
+        }
     };
 
     let mut amount: Option<u64> = None;
@@ -149,7 +155,12 @@ pub fn decode_cashub_token(token: &str) -> Result<CashuToken, CborError> {
 
     let map = match &value {
         ciborium::Value::Map(m) => m,
-        _ => return Err(CborError::TypeMismatch { field: "root", expected: "map" }),
+        _ => {
+            return Err(CborError::TypeMismatch {
+                field: "root",
+                expected: "map",
+            });
+        }
     };
 
     let mut mint: Option<String> = None;
@@ -160,103 +171,91 @@ pub fn decode_cashub_token(token: &str) -> Result<CashuToken, CborError> {
         match key.as_text() {
             Some("m") => mint = Some(value_as_string(val, "m")?),
             Some("u") => unit = Some(value_as_string(val, "u")?),
-            Some("t") => {
-                match val {
-                    ciborium::Value::Array(token_entries) => {
-                        for entry in token_entries {
-                            let entry_map = match entry {
-                                ciborium::Value::Map(m) => m,
-                                _ => {
-                                    return Err(CborError::TypeMismatch {
-                                        field: "t entry",
-                                        expected: "map",
-                                    });
+            Some("t") => match val {
+                ciborium::Value::Array(token_entries) => {
+                    for entry in token_entries {
+                        let entry_map = match entry {
+                            ciborium::Value::Map(m) => m,
+                            _ => {
+                                return Err(CborError::TypeMismatch {
+                                    field: "t entry",
+                                    expected: "map",
+                                });
+                            }
+                        };
+
+                        let mut keyset_id: Option<String> = None;
+                        let mut entry_proofs: Vec<Proof> = Vec::new();
+
+                        for (ek, ev) in entry_map.iter() {
+                            match ek.as_text() {
+                                Some("i") => {
+                                    keyset_id = Some(value_as_string(ev, "i")?);
                                 }
-                            };
-
-                            let mut keyset_id: Option<String> = None;
-                            let mut entry_proofs: Vec<Proof> = Vec::new();
-
-                            for (ek, ev) in entry_map.iter() {
-                                match ek.as_text() {
-                                    Some("i") => {
-                                        keyset_id = Some(value_as_string(ev, "i")?);
-                                    }
-                                    Some("p") => {
-                                        match ev {
-                                            ciborium::Value::Array(proof_items) => {
-                                                for proof_val in proof_items {
-                                                    let proof_map = match proof_val {
-                                                        ciborium::Value::Map(m) => m,
-                                                        _ => {
-                                                            return Err(CborError::TypeMismatch {
-                                                                field: "p entry",
-                                                                expected: "map",
-                                                            });
-                                                        }
-                                                    };
-
-                                                    let mut p_amount: Option<u64> = None;
-                                                    let mut p_secret: Option<String> = None;
-                                                    let mut p_c: Option<String> = None;
-
-                                                    for (pk, pv) in proof_map.iter() {
-                                                        match pk.as_text() {
-                                                            Some("a") => {
-                                                                p_amount =
-                                                                    Some(value_as_u64(pv, "a")?)
-                                                            }
-                                                            Some("s") => {
-                                                                p_secret =
-                                                                    Some(value_as_string(pv, "s")?)
-                                                            }
-                                                            Some("c") => {
-                                                                p_c =
-                                                                    Some(value_as_string(pv, "c")?)
-                                                            }
-                                                            _ => {}
-                                                        }
-                                                    }
-
-                                                    let id = keyset_id.clone().unwrap_or_default();
-                                                    entry_proofs.push(Proof {
-                                                        id,
-                                                        amount: p_amount
-                                                            .ok_or(CborError::MissingField(
-                                                                "a",
-                                                            ))?,
-                                                        secret: p_secret
-                                                            .ok_or(CborError::MissingField(
-                                                                "s",
-                                                            ))?,
-                                                        c: p_c
-                                                            .ok_or(CborError::MissingField("c"))?,
+                                Some("p") => match ev {
+                                    ciborium::Value::Array(proof_items) => {
+                                        for proof_val in proof_items {
+                                            let proof_map = match proof_val {
+                                                ciborium::Value::Map(m) => m,
+                                                _ => {
+                                                    return Err(CborError::TypeMismatch {
+                                                        field: "p entry",
+                                                        expected: "map",
                                                     });
                                                 }
+                                            };
+
+                                            let mut p_amount: Option<u64> = None;
+                                            let mut p_secret: Option<String> = None;
+                                            let mut p_c: Option<String> = None;
+
+                                            for (pk, pv) in proof_map.iter() {
+                                                match pk.as_text() {
+                                                    Some("a") => {
+                                                        p_amount = Some(value_as_u64(pv, "a")?)
+                                                    }
+                                                    Some("s") => {
+                                                        p_secret = Some(value_as_string(pv, "s")?)
+                                                    }
+                                                    Some("c") => {
+                                                        p_c = Some(value_as_string(pv, "c")?)
+                                                    }
+                                                    _ => {}
+                                                }
                                             }
-                                            _ => {
-                                                return Err(CborError::TypeMismatch {
-                                                    field: "p",
-                                                    expected: "array",
-                                                });
-                                            }
+
+                                            let id = keyset_id.clone().unwrap_or_default();
+                                            entry_proofs.push(Proof {
+                                                id,
+                                                amount: p_amount
+                                                    .ok_or(CborError::MissingField("a"))?,
+                                                secret: p_secret
+                                                    .ok_or(CborError::MissingField("s"))?,
+                                                c: p_c.ok_or(CborError::MissingField("c"))?,
+                                            });
                                         }
                                     }
-                                    _ => {}
-                                }
+                                    _ => {
+                                        return Err(CborError::TypeMismatch {
+                                            field: "p",
+                                            expected: "array",
+                                        });
+                                    }
+                                },
+                                _ => {}
                             }
-
-                            proofs.extend(entry_proofs);
                         }
-                    }
-                    _ => {
-                        return Err(CborError::TypeMismatch {
-                            field: "t",
-                            expected: "array",
-                        });
+
+                        proofs.extend(entry_proofs);
                     }
                 }
-            }
+                _ => {
+                    return Err(CborError::TypeMismatch {
+                        field: "t",
+                        expected: "array",
+                    });
+                }
+            },
             _ => {}
         }
     }
@@ -286,7 +285,10 @@ mod tests {
             (
                 ciborium::Value::Text("m".into()),
                 ciborium::Value::Array(
-                    mints.iter().map(|m| ciborium::Value::Text((*m).into())).collect(),
+                    mints
+                        .iter()
+                        .map(|m| ciborium::Value::Text((*m).into()))
+                        .collect(),
                 ),
             ),
         ];
@@ -300,7 +302,11 @@ mod tests {
         format!("{}{}", CREQ_PREFIX, URL_SAFE_NO_PAD.encode(&cbor))
     }
 
-    fn encode_cashub_cbor(mint: &str, unit: &str, proofs: &[(String, u64, String, String)]) -> Vec<u8> {
+    fn encode_cashub_cbor(
+        mint: &str,
+        unit: &str,
+        proofs: &[(String, u64, String, String)],
+    ) -> Vec<u8> {
         let proof_arr: Vec<ciborium::Value> = proofs
             .iter()
             .map(|(_id, amt, secret, c)| {
@@ -354,11 +360,7 @@ mod tests {
         buf
     }
 
-    fn make_cashub(
-        mint: &str,
-        unit: &str,
-        proofs: &[(String, u64, String, String)],
-    ) -> String {
+    fn make_cashub(mint: &str, unit: &str, proofs: &[(String, u64, String, String)]) -> String {
         let cbor = encode_cashub_cbor(mint, unit, proofs);
         format!("{}{}", CASHUB_PREFIX, URL_SAFE_NO_PAD.encode(&cbor))
     }
@@ -431,9 +433,24 @@ mod tests {
             "https://mint.example.com",
             "sat",
             &[
-                ("ks".to_string(), 2, "secret_a".to_string(), "cafe".to_string()),
-                ("ks".to_string(), 4, "secret_b".to_string(), "beef".to_string()),
-                ("ks".to_string(), 8, "secret_c".to_string(), "face".to_string()),
+                (
+                    "ks".to_string(),
+                    2,
+                    "secret_a".to_string(),
+                    "cafe".to_string(),
+                ),
+                (
+                    "ks".to_string(),
+                    4,
+                    "secret_b".to_string(),
+                    "beef".to_string(),
+                ),
+                (
+                    "ks".to_string(),
+                    8,
+                    "secret_c".to_string(),
+                    "face".to_string(),
+                ),
             ],
         );
         let result = decode_cashub_token(&token).expect("should decode cashuB");

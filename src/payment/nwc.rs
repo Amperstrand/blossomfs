@@ -95,23 +95,35 @@ impl NwcStrategy {
         Self { config }
     }
 
-    fn encrypt_nip04(&self, _sk: &SecretKey, _peer_pk: &PublicKey, _msg: &str) -> Result<String, PaymentError> {
-        Err(PaymentError::NwcEncrypt("NWC encryption not yet migrated to nostr-sdk 0.45-alpha".into()))
+    fn encrypt_nip04(
+        &self,
+        _sk: &SecretKey,
+        _peer_pk: &PublicKey,
+        _msg: &str,
+    ) -> Result<String, PaymentError> {
+        Err(PaymentError::NwcEncrypt(
+            "NWC encryption not yet migrated to nostr-sdk 0.45-alpha".into(),
+        ))
     }
 
-    fn decrypt_nip04(&self, _sk: &SecretKey, _peer_pk: &PublicKey, _msg: &str) -> Result<String, PaymentError> {
-        Err(PaymentError::NwcEncrypt("NWC decryption not yet migrated to nostr-sdk 0.45-alpha".into()))
+    fn decrypt_nip04(
+        &self,
+        _sk: &SecretKey,
+        _peer_pk: &PublicKey,
+        _msg: &str,
+    ) -> Result<String, PaymentError> {
+        Err(PaymentError::NwcEncrypt(
+            "NWC decryption not yet migrated to nostr-sdk 0.45-alpha".into(),
+        ))
     }
 }
 
 impl PaymentStrategy for NwcStrategy {
     fn pay(&self, payment_request: &str) -> Result<String, PaymentError> {
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| PaymentError::NwcRuntime(e.to_string()))?;
+        let rt =
+            tokio::runtime::Runtime::new().map_err(|e| PaymentError::NwcRuntime(e.to_string()))?;
 
-        rt.block_on(async {
-            self.pay_async(payment_request).await
-        })
+        rt.block_on(async { self.pay_async(payment_request).await })
     }
 }
 
@@ -131,11 +143,8 @@ impl NwcStrategy {
 
         // TODO: migrate to nostr-sdk 0.45-alpha encryption API
         // The nip04::encrypt/decrypt functions moved in 0.45-alpha
-        let encrypted_content = self.encrypt_nip04(
-            keys.secret_key(),
-            &self.config.wallet_pubkey,
-            &request_str,
-        )?;
+        let encrypted_content =
+            self.encrypt_nip04(keys.secret_key(), &self.config.wallet_pubkey, &request_str)?;
 
         let event = EventBuilder::new(Kind::Custom(NWC_REQUEST_KIND), encrypted_content)
             .tags(vec![Tag::public_key(self.config.wallet_pubkey)])
@@ -149,9 +158,7 @@ impl NwcStrategy {
             .add_relay(&self.config.relay)
             .await
             .map_err(|e| PaymentError::NwcRelay(e.to_string()))?;
-        client
-            .connect()
-            .await;
+        client.connect().await;
 
         let _ = client
             .send_event(&event)
@@ -266,10 +273,7 @@ mod tests {
     fn test_parse_nwc_uri_missing_secret() {
         let keys = Keys::generate();
         let pk = keys.public_key().to_hex();
-        let uri = format!(
-            "nostr+walletconnect://{}?relay=wss://relay.example.com",
-            pk
-        );
+        let uri = format!("nostr+walletconnect://{}?relay=wss://relay.example.com", pk);
 
         let result = parse_nwc_uri(&uri);
         assert!(matches!(result, Err(NwcParseError::MissingSecret)));
@@ -284,8 +288,7 @@ mod tests {
 
     #[test]
     fn test_parse_nwc_uri_invalid_pubkey() {
-        let uri =
-            "nostr+walletconnect://invalid_pubkey?relay=wss://r.example&secret=abc";
+        let uri = "nostr+walletconnect://invalid_pubkey?relay=wss://r.example&secret=abc";
         let result = parse_nwc_uri(uri);
         assert!(matches!(result, Err(NwcParseError::InvalidPubkey(_))));
     }
@@ -313,10 +316,7 @@ mod tests {
         };
 
         let strategy = NwcStrategy::from_config(config);
-        assert_eq!(
-            strategy.config.wallet_pubkey,
-            keys.public_key()
-        );
+        assert_eq!(strategy.config.wallet_pubkey, keys.public_key());
     }
 
     #[test]

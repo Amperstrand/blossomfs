@@ -25,7 +25,6 @@ use fuser::MountOption;
 
 use crate::blossom::client::BlossomClient;
 use crate::blossom::descriptor::BlobDescriptor;
-use crate::payment::PaymentStrategy;
 use crate::blossom::manifest::load_manifest;
 use crate::cli::{Cli, Command};
 use crate::fuse::fs::BlossomFS;
@@ -37,6 +36,7 @@ use crate::nostr::legacy_drive::{DriveEntry, fetch_drive_events};
 use crate::nostr::nip34::fetch_nip34_events;
 use crate::nostr::nip94::fetch_nip94_events;
 use crate::nostr::persist;
+use crate::payment::PaymentStrategy;
 use crate::util::path::sanitize_hostname;
 
 fn resolve_pubkey_hexes(args: &cli::MountArgs) -> Vec<String> {
@@ -136,7 +136,8 @@ fn main() {
     };
 
     match cli.command {
-        Command::Mount(mut args) => {
+        Command::Mount(args) => {
+            let mut args = *args;
             let mount_matches = matches.subcommand_matches("mount");
             let is_explicit = |name: &str| {
                 mount_matches
@@ -200,7 +201,10 @@ fn run_extend(args: cli::ExtendArgs) -> Result<(), Box<dyn std::error::Error>> {
             return Err("extend requires --cashu-token-file or --nwc-uri".into());
         };
 
-        match client.extend_blob_with_payment(&args.sha256, &auth_header, payment.as_ref()).await {
+        match client
+            .extend_blob_with_payment(&args.sha256, &auth_header, payment.as_ref())
+            .await
+        {
             Ok(desc) => {
                 println!("extended: {} ({} bytes)", desc.sha256, desc.size);
                 Ok(())
@@ -639,6 +643,7 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
                     (args.max_free_size_mb as usize) * 1024 * 1024,
                     args.max_cache_size * 1024 * 1024,
                     payment,
+                    (args.multipart_threshold_mb as usize) * 1024 * 1024,
                 ),
                 true,
             )

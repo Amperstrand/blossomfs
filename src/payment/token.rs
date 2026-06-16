@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
-use super::cbor::decode_creq;
 use super::PaymentError;
 use super::PaymentStrategy;
+use super::cbor::decode_creq;
 
 pub struct TokenStrategy {
     token: String,

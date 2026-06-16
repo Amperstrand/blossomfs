@@ -14,7 +14,7 @@ mod tests {
     fn parse_mount_args(args: &[&str]) -> Result<MountArgs, clap::Error> {
         let cli = Cli::try_parse_from(args)?;
         match cli.command {
-            Command::Mount(mount_args) => Ok(mount_args),
+            Command::Mount(mount_args) => Ok(*mount_args),
             _ => panic!("expected Mount command"),
         }
     }
@@ -242,7 +242,7 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Mount a Blossom filesystem
-    Mount(MountArgs),
+    Mount(Box<MountArgs>),
 
     Extend(ExtendArgs),
 }
@@ -329,8 +329,13 @@ pub struct MountArgs {
     #[arg(long, default_value_t = 31536000)]
     pub ttl_secs: u64,
 
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 1024)]
     pub max_write_mb: u64,
+
+    /// Files above this size use multipart upload (server must support it).
+    /// Files below use single-shot PUT. Default: 50 MB.
+    #[arg(long, default_value_t = 50)]
+    pub multipart_threshold_mb: u64,
 
     #[arg(long, default_value_t = 30)]
     pub free_period_days: u64,
@@ -387,7 +392,8 @@ impl Default for MountArgs {
             nip34_pubkey: None,
             nip34_clone: false,
             ttl_secs: 31536000,
-            max_write_mb: 100,
+            max_write_mb: 1024,
+            multipart_threshold_mb: 50,
             free_period_days: 30,
             max_free_size_mb: 1,
             max_cache_size: 0,

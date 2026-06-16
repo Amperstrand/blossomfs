@@ -57,7 +57,9 @@ pub trait PaymentStrategy: Send + Sync {
 }
 
 pub enum PaymentHandler {
-    Token { token: String },
+    Token {
+        token: String,
+    },
     Nwc {
         uri: String,
         relay: String,
@@ -71,15 +73,13 @@ impl PaymentHandler {
     pub fn build_strategy(&self) -> Option<Box<dyn PaymentStrategy>> {
         match self {
             PaymentHandler::Token { token } => Some(Box::new(TokenStrategy::new(token.clone()))),
-            PaymentHandler::Nwc { uri, .. } => {
-                match NwcStrategy::new(uri) {
-                    Ok(s) => Some(Box::new(s)),
-                    Err(e) => {
-                        tracing::error!("failed to create NWC strategy: {}", e);
-                        None
-                    }
+            PaymentHandler::Nwc { uri, .. } => match NwcStrategy::new(uri) {
+                Ok(s) => Some(Box::new(s)),
+                Err(e) => {
+                    tracing::error!("failed to create NWC strategy: {}", e);
+                    None
                 }
-            }
+            },
             PaymentHandler::None => None,
         }
     }

@@ -8,6 +8,7 @@
 
 #![allow(dead_code)]
 
+use serde::Deserialize;
 use thiserror::Error;
 
 use crate::blossom::descriptor::BlobDescriptor;
@@ -35,6 +36,23 @@ pub struct ListResponse {
     pub descriptors: Vec<BlobDescriptor>,
     /// Cursor for pagination (None if no more results).
     pub cursor: Option<String>,
+}
+
+/// Response from POST /upload/multipart (create session).
+#[derive(Debug, Deserialize)]
+pub struct MultipartUploadInit {
+    pub upload_id: String,
+    pub sha256: String,
+    pub chunk_size: u64,
+    pub total_chunks: u32,
+    pub expires_in: u64,
+}
+
+/// Response from PUT /upload/multipart/:id (upload chunk).
+#[derive(Debug, Deserialize)]
+pub struct MultipartPartResponse {
+    pub part_number: u32,
+    pub etag: String,
 }
 
 /// HTTP client for a single Blossom server.
@@ -274,7 +292,9 @@ impl BlossomClient {
         hasher.update(data);
         let sha256_hex = format!("{:x}", hasher.finalize());
 
-        let mut req = self.client.put(&url)
+        let mut req = self
+            .client
+            .put(&url)
             .header("Authorization", format!("Nostr {auth_header}"))
             .header("Content-Type", "application/octet-stream")
             .header("X-SHA-256", &sha256_hex);
@@ -292,14 +312,20 @@ impl BlossomClient {
         }
 
         if status.as_u16() == 402 {
-            let x_cashu = response.headers().get("x-cashu")
+            let x_cashu = response
+                .headers()
+                .get("x-cashu")
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or_default().to_string();
+                .unwrap_or_default()
+                .to_string();
             return Err(BlossomClientError::PaymentRequired { x_cashu });
         }
 
         let body = response.text().await.unwrap_or_default();
-        Err(BlossomClientError::ServerError { status: status.as_u16(), body })
+        Err(BlossomClientError::ServerError {
+            status: status.as_u16(),
+            body,
+        })
     }
 
     pub async fn upload_blob_with_payment(
@@ -312,7 +338,8 @@ impl BlossomClient {
             Ok(desc) => Ok(desc),
             Err(BlossomClientError::PaymentRequired { x_cashu }) => {
                 let payment_token = payment.pay(&x_cashu)?;
-                self.upload_attempt(&data, auth_header, Some(&payment_token)).await
+                self.upload_attempt(&data, auth_header, Some(&payment_token))
+                    .await
             }
             Err(e) => Err(e),
         }
@@ -325,7 +352,9 @@ impl BlossomClient {
         payment_token: Option<&str>,
     ) -> Result<BlobDescriptor, BlossomClientError> {
         let url = format!("{}/{}", self.base_url, sha256);
-        let mut req = self.client.patch(&url)
+        let mut req = self
+            .client
+            .patch(&url)
             .header("Authorization", format!("Nostr {auth_header}"));
 
         if let Some(token) = payment_token {
@@ -341,14 +370,20 @@ impl BlossomClient {
         }
 
         if status.as_u16() == 402 {
-            let x_cashu = response.headers().get("x-cashu")
+            let x_cashu = response
+                .headers()
+                .get("x-cashu")
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or_default().to_string();
+                .unwrap_or_default()
+                .to_string();
             return Err(BlossomClientError::PaymentRequired { x_cashu });
         }
 
         let body = response.text().await.unwrap_or_default();
-        Err(BlossomClientError::ServerError { status: status.as_u16(), body })
+        Err(BlossomClientError::ServerError {
+            status: status.as_u16(),
+            body,
+        })
     }
 
     pub async fn extend_blob_with_payment(
@@ -361,10 +396,139 @@ impl BlossomClient {
             Ok(desc) => Ok(desc),
             Err(BlossomClientError::PaymentRequired { x_cashu }) => {
                 let payment_token = payment.pay(&x_cashu)?;
-                self.extend_attempt(sha256, auth_header, Some(&payment_token)).await
+                self.extend_attempt(sha256, auth_header, Some(&payment_token))
+                    .await
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Initiate a multipart upload session (blossomflare).
+    ///
+    /// `POST /upload/multipart`
+    pub async fn init_multipart_upload(
+        &self,
+        content_length: u64,
+        content_type: &str,
+        auth_header: &str,
+    ) -> Result<MultipartUploadInit, BlossomClientError> {
+        let url = format!("{}/upload/multipart", self.base_url);
+        let body = serde_json::json!({
+            "content_length": content_length,
+            "content_type": content_type,
+        });
+        let response = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Nostr {auth_header}"))
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(BlossomClientError::ServerError {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let body = response.text().await?;
+        let init: MultipartUploadInit = serde_json::from_str(&body)?;
+        Ok(init)
+    }
+
+    /// Upload a single chunk (blossomflare).
+    ///
+    /// `PUT /upload/multipart/:upload_id`
+    pub async fn upload_multipart_part(
+        &self,
+        upload_id: &str,
+        part_number: u32,
+        data: Vec<u8>,
+        auth_header: &str,
+    ) -> Result<MultipartPartResponse, BlossomClientError> {
+        let url = format!("{}/upload/multipart/{}", self.base_url, upload_id);
+        let response = self
+            .client
+            .put(&url)
+            .header("Authorization", format!("Nostr {auth_header}"))
+            .header("X-Part-Number", part_number.to_string())
+            .header("Content-Type", "application/octet-stream")
+            .body(data)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(BlossomClientError::ServerError {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let body = response.text().await?;
+        let part: MultipartPartResponse = serde_json::from_str(&body)?;
+        Ok(part)
+    }
+
+    /// Complete a multipart upload (blossomflare).
+    ///
+    /// `POST /upload/multipart/:upload_id/complete`
+    pub async fn complete_multipart_upload(
+        &self,
+        upload_id: &str,
+        auth_header: &str,
+    ) -> Result<BlobDescriptor, BlossomClientError> {
+        let url = format!("{}/upload/multipart/{}/complete", self.base_url, upload_id);
+        let response = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Nostr {auth_header}"))
+            .header("Content-Type", "application/json")
+            .body("{}")
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(BlossomClientError::ServerError {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let body = response.text().await?;
+        let descriptor: BlobDescriptor = serde_json::from_str(&body)?;
+        Ok(descriptor)
+    }
+
+    /// Upload a blob using multipart, orchestrating init → chunks → complete.
+    ///
+    /// Convenience method that chains the three steps.
+    /// If init fails with 404/405, the error is returned (caller should fall back to single-shot).
+    pub async fn upload_blob_multipart(
+        &self,
+        data: &[u8],
+        content_type: &str,
+        auth_header: &str,
+    ) -> Result<BlobDescriptor, BlossomClientError> {
+        let init = self
+            .init_multipart_upload(data.len() as u64, content_type, auth_header)
+            .await?;
+
+        let chunk_size = init.chunk_size as usize;
+        for part_num in 1..=init.total_chunks {
+            let offset = (part_num as usize - 1) * chunk_size;
+            let end = std::cmp::min(offset + chunk_size, data.len());
+            let chunk = data[offset..end].to_vec();
+            self.upload_multipart_part(&init.upload_id, part_num, chunk, auth_header)
+                .await?;
+        }
+
+        self.complete_multipart_upload(&init.upload_id, auth_header)
+            .await
     }
 }
 
@@ -929,6 +1093,269 @@ mod tests {
                 assert!(body.contains("not found"));
             }
             other => panic!("expected ServerError, got {other:?}"),
+        }
+    }
+
+    // ── Scenario 19: Happy — init_multipart_upload returns fields ──────────
+
+    #[tokio::test]
+    async fn test_init_multipart_returns_fields() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/upload/multipart"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "upload_id": "sess123",
+                "sha256": "abc",
+                "chunk_size": 52428800u64,
+                "total_chunks": 3u32,
+                "expires_in": 3600u64
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client
+            .init_multipart_upload(150000000, "application/octet-stream", "tok")
+            .await;
+
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+        let init = result.unwrap();
+        assert_eq!(init.upload_id, "sess123");
+        assert_eq!(init.total_chunks, 3);
+        assert_eq!(init.chunk_size, 52428800);
+    }
+
+    // ── Scenario 20: Happy — init_multipart_upload sends Nostr auth ────────
+
+    #[tokio::test]
+    async fn test_init_multipart_sends_auth_header() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/upload/multipart"))
+            .and(header("Authorization", "Nostr tok"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "upload_id": "x",
+                "sha256": "x",
+                "chunk_size": 1u64,
+                "total_chunks": 1u32,
+                "expires_in": 1u64
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client
+            .init_multipart_upload(10, "application/octet-stream", "tok")
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "expected Ok (auth header matched), got {:?}",
+            result.err()
+        );
+    }
+
+    // ── Scenario 21: Edge — init_multipart_upload 404 → ServerError ────────
+
+    #[tokio::test]
+    async fn test_init_multipart_404_server_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/upload/multipart"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client
+            .init_multipart_upload(100, "application/octet-stream", "tok")
+            .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            BlossomClientError::ServerError { status, .. } => assert_eq!(status, 404),
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+    }
+
+    // ── Scenario 22: Happy — upload_multipart_part sends X-Part-Number ─────
+
+    #[tokio::test]
+    async fn test_upload_multipart_part_sends_part_number() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload/multipart/sess123"))
+            .and(header("X-Part-Number", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "part_number": 1u32,
+                "etag": "etag1"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client
+            .upload_multipart_part("sess123", 1, vec![1, 2, 3], "tok")
+            .await;
+
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+        let part = result.unwrap();
+        assert_eq!(part.part_number, 1);
+        assert_eq!(part.etag, "etag1");
+    }
+
+    // ── Scenario 23: Edge — upload_multipart_part 500 → ServerError ────────
+
+    #[tokio::test]
+    async fn test_upload_multipart_part_500_server_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload/multipart/sess123"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client
+            .upload_multipart_part("sess123", 1, vec![1, 2, 3], "tok")
+            .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            BlossomClientError::ServerError { status, .. } => assert_eq!(status, 500),
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+    }
+
+    // ── Scenario 24: Happy — complete_multipart_upload returns descriptor ──
+
+    #[tokio::test]
+    async fn test_complete_multipart_returns_descriptor() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/upload/multipart/sess123/complete"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(desc_json("comp1", 1700000000)))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client.complete_multipart_upload("sess123", "tok").await;
+
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+        let desc = result.unwrap();
+        assert_eq!(desc.sha256, "comp1");
+        assert_eq!(desc.size, 100);
+        assert_eq!(desc.url, "https://cdn.example.com/comp1");
+        assert_eq!(desc.uploaded, 1700000000);
+    }
+
+    // ── Scenario 25: Happy — upload_blob_multipart full flow (init→3×PUT→complete)
+
+    #[tokio::test]
+    async fn test_upload_blob_multipart_full_flow() {
+        let mock_server = MockServer::start().await;
+
+        // init: chunk_size=50, total_chunks=3 → 120B splits as 50+50+20
+        Mock::given(method("POST"))
+            .and(path("/upload/multipart"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "upload_id": "sess",
+                "sha256": "h",
+                "chunk_size": 50u64,
+                "total_chunks": 3u32,
+                "expires_in": 3600u64
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload/multipart/sess"))
+            .and(header("X-Part-Number", "1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "part_number": 1u32, "etag": "e1" })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload/multipart/sess"))
+            .and(header("X-Part-Number", "2"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "part_number": 2u32, "etag": "e2" })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload/multipart/sess"))
+            .and(header("X-Part-Number", "3"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "part_number": 3u32, "etag": "e3" })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/upload/multipart/sess/complete"))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(desc_json("fullflow", 1700000000)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let data = vec![0u8; 120];
+        let result = client
+            .upload_blob_multipart(&data, "application/octet-stream", "tok")
+            .await;
+
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+        let desc = result.unwrap();
+        assert_eq!(desc.sha256, "fullflow");
+        assert_eq!(desc.size, 100);
+    }
+
+    // ── Scenario 26: Edge — upload_blob_multipart init 404 short-circuits ──
+
+    #[tokio::test]
+    async fn test_upload_blob_multipart_init_404() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/upload/multipart"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        // complete must NEVER be called when init fails.
+        Mock::given(method("POST"))
+            .and(path("/upload/multipart/sess/complete"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(desc_json("never", 1)))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client
+            .upload_blob_multipart(&[0u8; 120], "application/octet-stream", "tok")
+            .await;
+
+        assert!(result.is_err(), "expected init failure to propagate");
+        match result.unwrap_err() {
+            BlossomClientError::ServerError { status, .. } => assert_eq!(status, 404),
+            other => panic!("expected ServerError from init, got {other:?}"),
         }
     }
 }

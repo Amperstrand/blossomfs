@@ -22,6 +22,7 @@ const ENV_FIELDS: &[&str] = &[
     "free_period_days",
     "max_free_size_mb",
     "max_cache_size",
+    "multipart_threshold_mb",
 ];
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -46,6 +47,7 @@ pub struct BlossomConfig {
     pub free_period_days: Option<u64>,
     pub max_free_size_mb: Option<u64>,
     pub max_cache_size: Option<u64>,
+    pub multipart_threshold_mb: Option<u64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -159,6 +161,11 @@ impl BlossomConfig {
             && let Some(v) = self.max_cache_size
         {
             args.max_cache_size = v;
+        }
+        if !is_explicit("multipart-threshold-mb")
+            && let Some(v) = self.multipart_threshold_mb
+        {
+            args.multipart_threshold_mb = v;
         }
     }
 }
