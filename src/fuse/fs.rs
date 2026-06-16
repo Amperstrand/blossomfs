@@ -19,7 +19,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::cache::fetch::fetch_and_cache;
 use crate::cache::object_cache::cache_path;
@@ -504,9 +504,40 @@ impl BlossomFS {
         let client = BlossomClient::new(server_url);
 
         // ── Dedup: skip upload if blob already exists (BUD-01) ──
-        match handle.block_on(client.head_blob(&sha256_hex)) {
-            Ok(true) => {
-                tracing::info!("blob already exists on server, skipping upload");
+        match handle.block_on(client.head_blob_with_expiry(&sha256_hex)) {
+            Ok(info) if info.exists => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let desired_expiry = now + self.free_period_secs;
+
+                let needs_extend = info.sunset.is_none_or(|s| s < desired_expiry);
+                if needs_extend {
+                    let days_left = info.sunset.map_or(0, |s| s.saturating_sub(now) / 86400);
+                    tracing::info!("blob exists, {days_left} days left, extending lease");
+                    match handle.block_on(client.extend_blob_with_payment(
+                        &sha256_hex,
+                        &auth_header,
+                        self.payment.as_ref(),
+                        Some(desired_expiry),
+                    )) {
+                        Ok(desc) => {
+                            tracing::info!(
+                                "lease extended to ~{} days",
+                                desc.expiration.unwrap_or(0).saturating_sub(now) / 86400
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "lease extension failed ({e}), blob still accessible until expiry"
+                            );
+                        }
+                    }
+                } else {
+                    tracing::info!("blob already exists with sufficient expiry, skipping upload");
+                }
+
                 let mut tree = self.tree.write().unwrap();
                 tree.update_file_node(
                     ino,
@@ -514,14 +545,14 @@ impl BlossomFS {
                         url: format!("{server_url}/{sha256_hex}"),
                         sha256: sha256_hex.clone(),
                         mime_type: None,
-                        expires: None,
+                        expires: info.sunset,
                     },
                     data_len as u64,
                     0,
                 );
                 return Ok(());
             }
-            Ok(false) => {}
+            Ok(_) => {}
             Err(e) => {
                 tracing::warn!("dedup check failed ({e}), proceeding with upload");
             }

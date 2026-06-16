@@ -202,7 +202,7 @@ fn run_extend(args: cli::ExtendArgs) -> Result<(), Box<dyn std::error::Error>> {
         };
 
         match client
-            .extend_blob_with_payment(&args.sha256, &auth_header, payment.as_ref())
+            .extend_blob_with_payment(&args.sha256, &auth_header, payment.as_ref(), None)
             .await
         {
             Ok(desc) => {

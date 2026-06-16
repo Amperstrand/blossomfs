@@ -55,6 +55,13 @@ pub struct MultipartPartResponse {
     pub etag: String,
 }
 
+/// Result of HEAD /<sha256> existence + expiry check.
+#[derive(Debug)]
+pub struct BlobHeadInfo {
+    pub exists: bool,
+    pub sunset: Option<u64>,
+}
+
 /// HTTP client for a single Blossom server.
 pub struct BlossomClient {
     client: reqwest::Client,
@@ -350,6 +357,7 @@ impl BlossomClient {
         sha256: &str,
         auth_header: &str,
         payment_token: Option<&str>,
+        desired_expiry: Option<u64>,
     ) -> Result<BlobDescriptor, BlossomClientError> {
         let url = format!("{}/{}", self.base_url, sha256);
         let mut req = self
@@ -359,6 +367,9 @@ impl BlossomClient {
 
         if let Some(token) = payment_token {
             req = req.header("X-Cashu", token);
+        }
+        if let Some(expiry) = desired_expiry {
+            req = req.header("X-Desired-Expiry", expiry.to_string());
         }
 
         let response = req.send().await?;
@@ -391,12 +402,16 @@ impl BlossomClient {
         sha256: &str,
         auth_header: &str,
         payment: &dyn PaymentStrategy,
+        desired_expiry: Option<u64>,
     ) -> Result<BlobDescriptor, BlossomClientError> {
-        match self.extend_attempt(sha256, auth_header, None).await {
+        match self
+            .extend_attempt(sha256, auth_header, None, desired_expiry)
+            .await
+        {
             Ok(desc) => Ok(desc),
             Err(BlossomClientError::PaymentRequired { x_cashu }) => {
                 let payment_token = payment.pay(&x_cashu)?;
-                self.extend_attempt(sha256, auth_header, Some(&payment_token))
+                self.extend_attempt(sha256, auth_header, Some(&payment_token), desired_expiry)
                     .await
             }
             Err(e) => Err(e),
@@ -552,6 +567,45 @@ impl BlossomClient {
         }
     }
 
+    /// Check if a blob exists and return its expiry from the `Sunset` header (BUD-01).
+    ///
+    /// Returns `Ok(Some(unix_ts))` if the blob exists (Sunset header parsed),
+    /// `Ok(None)` if the blob does not exist (404) or has no Sunset header,
+    /// or `Err` on server errors.
+    pub async fn head_blob_with_expiry(
+        &self,
+        sha256: &str,
+    ) -> Result<BlobHeadInfo, BlossomClientError> {
+        let url = format!("{}/{}", self.base_url, sha256);
+        let response = self.client.head(&url).send().await?;
+        let status = response.status();
+
+        if status.is_success() {
+            let sunset = response
+                .headers()
+                .get("sunset")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| httpdate::parse_http_date(s).ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
+            Ok(BlobHeadInfo {
+                exists: true,
+                sunset,
+            })
+        } else if status.as_u16() == 404 {
+            Ok(BlobHeadInfo {
+                exists: false,
+                sunset: None,
+            })
+        } else {
+            let body = response.text().await.unwrap_or_default();
+            Err(BlossomClientError::ServerError {
+                status: status.as_u16(),
+                body,
+            })
+        }
+    }
+
     /// Pre-flight check before upload (BUD-06).
     ///
     /// `HEAD /upload` with `X-SHA-256`, `X-Content-Length`, `X-Content-Type`
@@ -607,7 +661,6 @@ mod tests {
 
     // ── Helpers ────────────────────────────────────────────────────────────
 
-    /// Build a single blob-descriptor JSON value.
     fn desc_json(sha: &str, uploaded: u64) -> serde_json::Value {
         serde_json::json!({
             "url": format!("https://cdn.example.com/{}", sha),
@@ -616,6 +669,13 @@ mod tests {
             "type": "image/png",
             "uploaded": uploaded
         })
+    }
+
+    struct MockPayment;
+    impl crate::payment::PaymentStrategy for MockPayment {
+        fn pay(&self, _req: &str) -> Result<String, crate::payment::PaymentError> {
+            Ok("cashuBproof".to_string())
+        }
     }
 
     // ── Scenario 1: Happy — list_blobs returns 3 descriptors ──────────────
@@ -1490,6 +1550,169 @@ mod tests {
         let result = client.head_blob("abc123def456").await;
 
         assert!(result.is_err());
+    }
+
+    // ── BUD-01: head_blob_with_expiry ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_head_blob_with_expiry_parses_sunset() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .and(path("/abc123"))
+            .respond_with(
+                ResponseTemplate::new(200).insert_header("sunset", "Wed, 17 Jun 2026 12:00:00 GMT"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let info = client.head_blob_with_expiry("abc123").await.unwrap();
+
+        assert!(info.exists);
+        assert!(info.sunset.is_some(), "sunset should be parsed");
+    }
+
+    #[tokio::test]
+    async fn test_head_blob_with_expiry_no_sunset_header() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .and(path("/abc123"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let info = client.head_blob_with_expiry("abc123").await.unwrap();
+
+        assert!(info.exists);
+        assert!(
+            info.sunset.is_none(),
+            "sunset should be None when header absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_head_blob_with_expiry_not_found() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .and(path("/abc123"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let info = client.head_blob_with_expiry("abc123").await.unwrap();
+
+        assert!(!info.exists);
+        assert!(info.sunset.is_none());
+    }
+
+    // ── Extend with X-Desired-Expiry ──────────────────────────────────
+
+    #[tokio::test]
+    async fn test_extend_sends_desired_expiry_header() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PATCH"))
+            .and(path("/abc123"))
+            .and(header("X-Desired-Expiry", "9999999999"))
+            .and(header("Authorization", "Nostr tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(desc_json("abc123", 1000)))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client
+            .extend_blob_with_payment(
+                "abc123",
+                "tok",
+                &crate::payment::NoPayment,
+                Some(9999999999),
+            )
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_extend_without_desired_expiry_omits_header() {
+        let mock_server = MockServer::start().await;
+
+        // Match any PATCH that does NOT have X-Desired-Expiry
+        Mock::given(method("PATCH"))
+            .and(path("/abc123"))
+            .and(header("Authorization", "Nostr tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(desc_json("abc123", 1000)))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client
+            .extend_blob_with_payment("abc123", "tok", &crate::payment::NoPayment, None)
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_extend_desired_expiry_200_already_covered() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PATCH"))
+            .and(path("/abc123"))
+            .and(header("X-Desired-Expiry", "1000"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(desc_json("abc123", 1000)))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client
+            .extend_blob_with_payment("abc123", "tok", &crate::payment::NoPayment, Some(1000))
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "server returns 200 when expiry already covered"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extend_desired_expiry_402_then_pay() {
+        let mock_server = MockServer::start().await;
+
+        // First attempt (no payment) → 402, only responds once
+        Mock::given(method("PATCH"))
+            .and(path("/abc123"))
+            .and(header("X-Desired-Expiry", "999999"))
+            .respond_with(
+                ResponseTemplate::new(402)
+                    .insert_header("X-Cashu", "creqAtest")
+                    .insert_header("X-Price-Sats", "5"),
+            )
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        // Second attempt (with payment) → 200
+        Mock::given(method("PATCH"))
+            .and(path("/abc123"))
+            .and(header("X-Cashu", "cashuBproof"))
+            .and(header("X-Desired-Expiry", "999999"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(desc_json("abc123", 1000)))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client
+            .extend_blob_with_payment("abc123", "tok", &MockPayment, Some(999999))
+            .await;
+
+        assert!(result.is_ok());
     }
 
     // ── BUD-06: preflight_upload ───────────────────────────────────────
