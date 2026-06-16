@@ -53,7 +53,7 @@ mod tests {
         assert!(result.is_ok(), "Should parse successfully");
         let mount_args = result.unwrap();
         assert_eq!(mount_args.mountpoint, PathBuf::from("/mnt/test"));
-        assert_eq!(mount_args.npub, Some(String::from("npub1xyz")));
+        assert_eq!(mount_args.npub, vec![String::from("npub1xyz")]);
     }
 
     #[test]
@@ -187,9 +187,9 @@ mod tests {
         let mount_args = result.unwrap();
         assert_eq!(
             mount_args.pubkey,
-            Some(String::from(
+            vec![String::from(
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-            ))
+            )]
         );
     }
 
@@ -251,13 +251,13 @@ pub struct MountArgs {
     #[arg(long)]
     pub mountpoint: PathBuf,
 
-    /// Bech32 public key (npub1...)
+    /// Bech32 public key (npub1..., repeatable for multiple users)
     #[arg(long)]
-    pub npub: Option<String>,
+    pub npub: Vec<String>,
 
-    /// Hex public key (64 hex chars)
+    /// Hex public key (64 hex chars, repeatable for multiple users)
     #[arg(long)]
-    pub pubkey: Option<String>,
+    pub pubkey: Vec<String>,
 
     /// Blossom server URL (repeatable)
     #[arg(long)]
@@ -335,6 +335,11 @@ pub struct MountArgs {
     #[arg(long)]
     pub persist: Option<String>,
 
+    /// Maximum number of blobs to load per server (0 = unlimited).
+    /// Caps mount time for accounts with many blobs.
+    #[arg(long, default_value_t = 1000)]
+    pub max_blobs: u64,
+
     #[arg(long)]
     pub config: Option<PathBuf>,
 
@@ -346,8 +351,8 @@ impl Default for MountArgs {
     fn default() -> Self {
         MountArgs {
             mountpoint: PathBuf::new(),
-            npub: None,
-            pubkey: None,
+            npub: Vec::new(),
+            pubkey: Vec::new(),
             server: Vec::new(),
             manifest: None,
             cache_dir: PathBuf::from("/tmp/blossomfs"),
@@ -364,6 +369,7 @@ impl Default for MountArgs {
             max_free_size_mb: 1,
             max_cache_size: 0,
             persist: None,
+            max_blobs: 1000,
             config: None,
             daemon: false,
         }

@@ -36,16 +36,17 @@ use crate::nostr::nip94::fetch_nip94_events;
 use crate::nostr::persist;
 use crate::util::path::sanitize_hostname;
 
-fn resolve_pubkey_hex(args: &cli::MountArgs) -> Option<String> {
-    if let Some(ref pk) = args.pubkey {
-        return Some(pk.clone());
+fn resolve_pubkey_hexes(args: &cli::MountArgs) -> Vec<String> {
+    let mut result = Vec::new();
+    for pk in &args.pubkey {
+        result.push(pk.clone());
     }
-    if let Some(ref npub) = args.npub
-        && let Ok(pk) = parse_npub(npub)
-    {
-        return Some(pk.to_hex());
+    for npub_str in &args.npub {
+        if let Ok(pk) = parse_npub(npub_str) {
+            result.push(pk.to_hex());
+        }
     }
-    None
+    result
 }
 
 fn ensure_drive_path(tree: &mut Tree, root: u64, path: &str) -> u64 {
@@ -181,7 +182,8 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut all_descriptors: Vec<crate::blossom::descriptor::BlobDescriptor> = Vec::new();
 
     // Resolve pubkey hex from --pubkey or --npub
-    let pubkey_hex = resolve_pubkey_hex(&args);
+    let pubkey_hexes = resolve_pubkey_hexes(&args);
+    let pubkey_hex = pubkey_hexes.first().cloned();
 
     // Discover servers via NIP-B7/BUD-03 (kind 10063) if relays are provided
     let mut effective_servers = args.server.clone();
@@ -247,10 +249,18 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // --- Server sources: /public/<pubkey>/servers/<host>/ and /public/<pubkey>/all-servers/ ---
-    if !effective_servers.is_empty() {
-        let pk_label = pubkey_hex.as_deref().unwrap_or("all");
+    if !effective_servers.is_empty()
+        && let Some(pd) = public_dir
+    {
+        let pubkeys_to_list: Vec<&str> = if pubkey_hexes.is_empty() {
+            vec!["all"]
+        } else {
+            pubkey_hexes.iter().map(|s| s.as_str()).collect()
+        };
+        let max = args.max_blobs as usize;
 
-        if let Some(pd) = public_dir {
+        for pk_label in &pubkeys_to_list {
+            let mut pubkey_descriptors: Vec<BlobDescriptor> = Vec::new();
             let pubkey_dir = tree.add_directory(pd, pk_label);
             let servers_dir = tree.add_directory(pubkey_dir, "servers");
 
@@ -260,7 +270,7 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
 
                 let client = BlossomClient::new(server_url);
                 tracing::info!("listing blobs from {} for pubkey={}", server_url, pk_label);
-                match rt.block_on(client.list_all_blobs(pk_label)) {
+                match rt.block_on(client.list_all_blobs(pk_label, max, BlossomClient::PAGE_SIZE)) {
                     Ok(raw) => {
                         let descriptors: Vec<BlobDescriptor> = raw
                             .into_iter()
@@ -280,6 +290,7 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
                         tracing::info!("listed {} blobs from {}", descriptors.len(), server_url);
                         blob_count += descriptors.len();
                         all_descriptors.extend(descriptors.clone());
+                        pubkey_descriptors.extend(descriptors.clone());
                         tree.build_from_descriptors(host_dir, &descriptors);
                     }
                     Err(e) => {
@@ -288,10 +299,9 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // All-servers aggregate: only by-sha256, deduplicated
-            if !all_descriptors.is_empty() {
+            if !pubkey_descriptors.is_empty() {
                 let all_dir = tree.add_directory(pubkey_dir, "all-servers");
-                tree.build_by_sha256_only(all_dir, &all_descriptors);
+                tree.build_by_sha256_only(all_dir, &pubkey_descriptors);
             }
         }
     }
@@ -456,13 +466,19 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Add virtual files
-    let npub_display = args.npub.as_deref().unwrap_or("all");
+    let npub_display = args
+        .npub
+        .first()
+        .or_else(|| args.pubkey.first())
+        .map(|s| s.as_str())
+        .unwrap_or("all");
     let server_count = effective_servers.len();
     let mount_info = MountInfo {
         mountpoint: args.mountpoint.display().to_string(),
         npub: npub_display.to_string(),
         server_count,
         blob_count,
+        max_blobs: args.max_blobs,
         cache_dir: args.cache_dir.display().to_string(),
         expiring_soon,
     };

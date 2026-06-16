@@ -40,9 +40,8 @@ pub struct BlossomClient {
 
 impl BlossomClient {
     /// Default page size used by `list_all_blobs` for automatic pagination.
-    const PAGE_SIZE: u32 = 2;
+    pub const PAGE_SIZE: u32 = 500;
 
-    /// Maximum number of pages to fetch in `list_all_blobs` (safety guard).
     const MAX_PAGES: usize = 10_000;
 
     /// Create a new client for the given base URL (e.g. "https://cdn.example.com").
@@ -119,16 +118,23 @@ impl BlossomClient {
     pub async fn list_all_blobs(
         &self,
         pubkey_hex: &str,
+        max: usize,
+        page_size: u32,
     ) -> Result<Vec<BlobDescriptor>, BlossomClientError> {
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
 
         for _ in 0..Self::MAX_PAGES {
             let response = self
-                .list_blobs(pubkey_hex, cursor.as_deref(), Some(Self::PAGE_SIZE))
+                .list_blobs(pubkey_hex, cursor.as_deref(), Some(page_size))
                 .await?;
 
             all.extend(response.descriptors);
+
+            if max > 0 && all.len() >= max {
+                all.truncate(max);
+                return Ok(all);
+            }
 
             match response.cursor {
                 Some(c) => cursor = Some(c),
@@ -405,7 +411,7 @@ mod tests {
             .await;
 
         let client = BlossomClient::new(mock_server.uri());
-        let result = client.list_all_blobs("pagepk").await;
+        let result = client.list_all_blobs("pagepk", 0, 2).await;
 
         assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
         let blobs = result.unwrap();
@@ -432,7 +438,7 @@ mod tests {
             .await;
 
         let client = BlossomClient::new(mock_server.uri());
-        let result = client.list_all_blobs("singlepk").await;
+        let result = client.list_all_blobs("singlepk", 0, 2).await;
 
         assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
         let blobs = result.unwrap();

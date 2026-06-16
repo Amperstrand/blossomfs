@@ -15,6 +15,7 @@ pub struct MountInfo {
     pub npub: String,
     pub server_count: usize,
     pub blob_count: usize,
+    pub max_blobs: u64,
     pub cache_dir: String,
     pub expiring_soon: Vec<(String, u64)>,
 }
@@ -65,17 +66,26 @@ pub fn generate_status(info: &MountInfo) -> Vec<u8> {
         Err(_) => 0,
     };
 
+    let blob_line = if info.blob_count as u64 >= info.max_blobs && info.max_blobs > 0 {
+        format!(
+            "Total blobs: {} (capped at {} — more may exist)",
+            info.blob_count, info.max_blobs
+        )
+    } else {
+        format!("Total blobs: {}", info.blob_count)
+    };
+
     let mut content = format!(
         "BlossomFS Status
 ===============
 
 Servers configured: {}
-Total blobs: {}
+{}
 Pubkey: {}
 Cache directory: {}
 Last updated: {}
 ",
-        info.server_count, info.blob_count, info.npub, info.cache_dir, now
+        info.server_count, blob_line, info.npub, info.cache_dir, now
     );
 
     if !info.expiring_soon.is_empty() {
@@ -109,6 +119,7 @@ mod tests {
             npub: "npub1testnpub123456789".to_string(),
             server_count: 3,
             blob_count: 42,
+            max_blobs: 1000,
             cache_dir: "/tmp/blossomfs_cache".to_string(),
             expiring_soon: Vec::new(),
         }
@@ -239,6 +250,7 @@ mod tests {
             npub: "npub1testnpub123456789".to_string(),
             server_count: 3,
             blob_count: 42,
+            max_blobs: 1000,
             cache_dir: "/tmp/blossomfs_cache".to_string(),
             expiring_soon: Vec::new(),
         };
@@ -248,6 +260,7 @@ mod tests {
             npub: "npub1testnpub123456789".to_string(),
             server_count: 3,
             blob_count: 99,
+            max_blobs: 1000,
             cache_dir: "/tmp/blossomfs_cache".to_string(),
             expiring_soon: Vec::new(),
         };
@@ -270,6 +283,7 @@ mod tests {
             npub: "npub1testnpub123456789".to_string(),
             server_count: 0,
             blob_count: 42,
+            max_blobs: 1000,
             cache_dir: "/tmp/blossomfs_cache".to_string(),
             expiring_soon: Vec::new(),
         };
@@ -292,6 +306,7 @@ mod tests {
             npub: "npub1testnpub123456789".to_string(),
             server_count: 3,
             blob_count: 0,
+            max_blobs: 1000,
             cache_dir: "/tmp/blossomfs_cache".to_string(),
             expiring_soon: Vec::new(),
         };

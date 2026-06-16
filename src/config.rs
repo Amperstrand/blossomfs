@@ -90,11 +90,15 @@ impl BlossomConfig {
     where
         F: Fn(&str) -> bool,
     {
-        if !is_explicit("npub") && self.npub.is_some() {
-            args.npub = self.npub.clone();
+        if !is_explicit("npub")
+            && let Some(ref n) = self.npub
+        {
+            args.npub = vec![n.clone()];
         }
-        if !is_explicit("pubkey") && self.pubkey.is_some() {
-            args.pubkey = self.pubkey.clone();
+        if !is_explicit("pubkey")
+            && let Some(ref p) = self.pubkey
+        {
+            args.pubkey = vec![p.clone()];
         }
         if !is_explicit("manifest") && self.manifest.is_some() {
             args.manifest = self.manifest.clone();
@@ -204,7 +208,7 @@ read_only = false
         let mut args = default_args();
         config.merge_into(&mut args, |_| false);
 
-        assert_eq!(args.npub.as_deref(), Some("npub1test"));
+        assert_eq!(args.npub.first().map(|s| s.as_str()), Some("npub1test"));
         assert_eq!(args.server.len(), 1);
         assert_eq!(args.ttl_secs, 3600);
     }
@@ -221,7 +225,7 @@ read_only = false
         let mut args = default_args();
         config.merge_into(&mut args, |_| true);
 
-        assert_ne!(args.npub.as_deref(), Some("npub1config"));
+        assert!(args.npub.is_empty());
         assert_ne!(args.ttl_secs, 3600);
     }
 
@@ -237,7 +241,7 @@ read_only = false
         let mut args = default_args();
         config.merge_into(&mut args, |name| name == "npub");
 
-        assert!(args.npub.is_none());
+        assert!(args.npub.is_empty());
         assert_eq!(args.server.len(), 1);
         assert_eq!(args.server[0], "https://config.example.com");
         assert_eq!(args.ttl_secs, 3600);
@@ -350,7 +354,7 @@ read_only = false
         unsafe {
             std::env::remove_var("BLOSSOMFS_NPUB");
         }
-        assert_eq!(args.npub.as_deref(), Some("npub1envtest"));
+        assert_eq!(args.npub.first().map(|s| s.as_str()), Some("npub1envtest"));
     }
 
     #[test]
