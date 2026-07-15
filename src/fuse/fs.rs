@@ -39,20 +39,49 @@ use crate::blossom::descriptor::BlobDescriptor;
 use crate::fuse::tree::{FileContent, LazyDir, NodeKind, Tree, TreeNode};
 use crate::nostr::auth::{create_delete_auth_header, create_upload_auth_header};
 
+use std::io::{Read, Seek, SeekFrom, Write};
+use tempfile::NamedTempFile;
+
 // ---------------------------------------------------------------------------
 // WriteBuffer
 // ---------------------------------------------------------------------------
+
+/// Where write data is currently stored.
+enum WriteStorage {
+    Memory(Vec<u8>),
+    Disk(NamedTempFile, u64),
+}
+
+impl WriteStorage {
+    fn len(&self) -> usize {
+        match self {
+            WriteStorage::Memory(v) => v.len(),
+            WriteStorage::Disk(_, n) => *n as usize,
+        }
+    }
+
+    /// Read all data into a Vec. For Disk, seeks to start and reads the file.
+    fn read_all(&mut self) -> std::io::Result<Vec<u8>> {
+        match self {
+            WriteStorage::Memory(v) => Ok(v.clone()),
+            WriteStorage::Disk(file, _) => {
+                file.seek(SeekFrom::Start(0))?;
+                let mut data = Vec::new();
+                file.read_to_end(&mut data)?;
+                Ok(data)
+            }
+        }
+    }
+}
 
 /// Tracks data written to a file handle before upload.
 struct WriteBuffer {
     ino: u64,
     parent: u64,
     name: String,
-    data: Vec<u8>,
-    /// Whether the data has already been uploaded (flush may fire
-    /// multiple times due to fork/dup; we only upload once).
+    storage: WriteStorage,
+    hasher: Sha256,
     flushed: bool,
-    /// When true (O_APPEND), writes ignore the offset and append to the end.
     append: bool,
 }
 
@@ -80,6 +109,8 @@ pub struct BlossomFS {
     max_free_size_bytes: usize,
     max_cache_bytes: u64,
     multipart_threshold: usize,
+    spill_threshold: usize,
+    upload_sem: Arc<tokio::sync::Semaphore>,
     /// Sha256 hashes currently being fetched. Prevents duplicate HTTP
     /// downloads when multiple FUSE read() calls hit the same uncached blob.
     fetch_in_progress: Arc<(Mutex<HashSet<String>>, Condvar)>,
@@ -106,6 +137,8 @@ impl BlossomFS {
             max_free_size_bytes: 1024 * 1024,
             max_cache_bytes: 0,
             multipart_threshold: 50 * 1024 * 1024,
+            spill_threshold: 64 * 1024 * 1024,
+            upload_sem: Arc::new(tokio::sync::Semaphore::new(5)),
             fetch_in_progress: Arc::new((Mutex::new(HashSet::new()), Condvar::new())),
             frozen: Arc::new(AtomicBool::new(false)),
             payment: Arc::new(crate::payment::NoPayment),
@@ -142,6 +175,8 @@ impl BlossomFS {
             max_free_size_bytes,
             max_cache_bytes,
             multipart_threshold: 50 * 1024 * 1024,
+            spill_threshold: 64 * 1024 * 1024,
+            upload_sem: Arc::new(tokio::sync::Semaphore::new(5)),
             fetch_in_progress: Arc::new((Mutex::new(HashSet::new()), Condvar::new())),
             frozen: Arc::new(AtomicBool::new(false)),
             payment: Arc::new(crate::payment::NoPayment),
@@ -167,6 +202,8 @@ impl BlossomFS {
         max_cache_bytes: u64,
         payment: Arc<dyn crate::payment::PaymentStrategy>,
         multipart_threshold: usize,
+        spill_threshold: usize,
+        upload_sem: Arc<tokio::sync::Semaphore>,
     ) -> Self {
         Self {
             tree: Arc::new(RwLock::new(tree)),
@@ -183,6 +220,8 @@ impl BlossomFS {
             max_free_size_bytes,
             max_cache_bytes,
             multipart_threshold,
+            spill_threshold,
+            upload_sem,
             fetch_in_progress: Arc::new((Mutex::new(HashSet::new()), Condvar::new())),
             frozen: Arc::new(AtomicBool::new(false)),
             payment,
@@ -480,7 +519,7 @@ impl BlossomFS {
     /// failures (network errors, HTTP 5xx, 429). Permanent failures (4xx) and
     /// auth-creation errors return immediately. Returns `Err(())` on final
     /// failure — caller is responsible for cleanup.
-    fn do_upload(&self, ino: u64, data: Vec<u8>) -> Result<(), ()> {
+    fn do_upload(&self, ino: u64, data: Vec<u8>, sha256_hex: &str) -> Result<(), ()> {
         let (keys, server_url, handle) = match (&self.keys, &self.server_url, &self.runtime_handle)
         {
             (Some(k), Some(s), Some(h)) => (k, s, h),
@@ -491,9 +530,16 @@ impl BlossomFS {
         };
 
         let data_len = data.len();
-        let sha256_hex = hex::encode(Sha256::digest(&data));
 
-        let auth_header = match create_upload_auth_header(keys, &sha256_hex, data_len as u64) {
+        let _permit = match handle.block_on(self.upload_sem.acquire()) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::error!("failed to acquire upload permit: {e}");
+                None
+            }
+        };
+
+        let auth_header = match create_upload_auth_header(keys, sha256_hex, data_len as u64) {
             Ok(h) => h,
             Err(e) => {
                 tracing::error!("auth creation failed: {}", e);
@@ -504,7 +550,7 @@ impl BlossomFS {
         let client = BlossomClient::new(server_url);
 
         // ── Dedup: skip upload if blob already exists (BUD-01) ──
-        match handle.block_on(client.head_blob_with_expiry(&sha256_hex)) {
+        match handle.block_on(client.head_blob_with_expiry(sha256_hex)) {
             Ok(info) if info.exists => {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -517,7 +563,7 @@ impl BlossomFS {
                     let days_left = info.sunset.map_or(0, |s| s.saturating_sub(now) / 86400);
                     tracing::info!("blob exists, {days_left} days left, extending lease");
                     match handle.block_on(client.extend_blob_with_payment(
-                        &sha256_hex,
+                        sha256_hex,
                         &auth_header,
                         self.payment.as_ref(),
                         Some(desired_expiry),
@@ -543,7 +589,7 @@ impl BlossomFS {
                     ino,
                     FileContent::Remote {
                         url: format!("{server_url}/{sha256_hex}"),
-                        sha256: sha256_hex.clone(),
+                        sha256: sha256_hex.to_string(),
                         mime_type: None,
                         expires: info.sunset,
                     },
@@ -561,7 +607,7 @@ impl BlossomFS {
         // ── Preflight: check server will accept upload (BUD-06) ──
         match handle.block_on(client.preflight_upload(
             &auth_header,
-            &sha256_hex,
+            sha256_hex,
             data_len as u64,
             "application/octet-stream",
         )) {
@@ -879,7 +925,12 @@ impl Filesystem for BlossomFS {
                 ino: ino.0,
                 parent: 0,
                 name: String::new(),
-                data: initial_data,
+                storage: WriteStorage::Memory(initial_data.clone()),
+                hasher: {
+                    let mut h = Sha256::new();
+                    h.update(&initial_data);
+                    h
+                },
                 flushed: false,
                 append: o_append,
             },
@@ -1236,7 +1287,7 @@ impl Filesystem for BlossomFS {
                 }
             };
             let effective_offset = if buf.append {
-                buf.data.len() as u64
+                buf.storage.len() as u64
             } else {
                 offset
             };
@@ -1246,11 +1297,41 @@ impl Filesystem for BlossomFS {
                 reply.error(Errno::EFBIG);
                 return;
             }
-            if buf.data.len() < end {
-                buf.data.resize(end, 0);
+
+            buf.hasher.update(data);
+
+            match &mut buf.storage {
+                WriteStorage::Memory(v) => {
+                    if end > self.spill_threshold {
+                        let mut temp = NamedTempFile::new().unwrap_or_else(|e| {
+                            tracing::error!("failed to create spill file: {e}");
+                            panic!("spill file creation failed: {e}");
+                        });
+                        if v.len() < effective_offset as usize {
+                            temp.write_all(v).unwrap();
+                            let gap = effective_offset as usize - v.len();
+                            temp.write_all(&vec![0u8; gap]).unwrap();
+                        } else {
+                            temp.write_all(v).unwrap();
+                        }
+                        temp.write_all(data).unwrap();
+                        tracing::debug!("spilled write buffer to disk at {} bytes", end);
+                        buf.storage = WriteStorage::Disk(temp, end as u64);
+                    } else {
+                        if v.len() < end {
+                            v.resize(end, 0);
+                        }
+                        v[effective_offset as usize..end].copy_from_slice(data);
+                    }
+                }
+                WriteStorage::Disk(file, written) => {
+                    file.seek(SeekFrom::Start(effective_offset)).unwrap();
+                    file.write_all(data).unwrap();
+                    *written = end as u64;
+                }
             }
-            buf.data[effective_offset as usize..end].copy_from_slice(data);
-            (buf.ino, buf.data.len() as u64)
+
+            (buf.ino, buf.storage.len() as u64)
         };
 
         {
@@ -1269,20 +1350,18 @@ impl Filesystem for BlossomFS {
         _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
-        // flush() can fire multiple times per open (fork/dup). We do NOT
-        // remove the WriteBuffer here — only upload once and let release()
-        // handle final cleanup.
-
-        let mut to_upload: Option<(u64, Vec<u8>)> = None;
+        let mut to_upload: Option<(u64, Vec<u8>, String)> = None;
 
         {
             let mut state = self.write_state.lock().unwrap();
             if let Some(buf) = state.get_mut(&fh.0)
                 && !buf.flushed
-                && !buf.data.is_empty()
+                && buf.storage.len() > 0
             {
                 buf.flushed = true;
-                to_upload = Some((buf.ino, buf.data.clone()));
+                let sha256_hex = hex::encode(buf.hasher.clone().finalize());
+                let data = buf.storage.read_all().unwrap_or_default();
+                to_upload = Some((buf.ino, data, sha256_hex));
             }
         }
 
@@ -1290,7 +1369,7 @@ impl Filesystem for BlossomFS {
             None => {
                 reply.ok();
             }
-            Some((ino, data)) => match self.do_upload(ino, data) {
+            Some((ino, data, sha256_hex)) => match self.do_upload(ino, data, &sha256_hex) {
                 Ok(()) => reply.ok(),
                 Err(()) => reply.error(Errno::EIO),
             },
@@ -1307,16 +1386,15 @@ impl Filesystem for BlossomFS {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        // release() is called exactly once when all fd references are closed.
-        // This is the correct place to clean up the WriteBuffer. If flush()
-        // didn't fire (or had no data), we do a fallback upload here.
         let buf = self.write_state.lock().unwrap().remove(&fh.0);
 
-        if let Some(buf) = buf
+        if let Some(mut buf) = buf
             && !buf.flushed
-            && !buf.data.is_empty()
+            && buf.storage.len() > 0
         {
-            match self.do_upload(buf.ino, buf.data.clone()) {
+            let sha256_hex = hex::encode(buf.hasher.clone().finalize());
+            let data = buf.storage.read_all().unwrap_or_default();
+            match self.do_upload(buf.ino, data, &sha256_hex) {
                 Ok(()) => {}
                 Err(()) => {
                     tracing::error!("fallback upload failed in release()");
@@ -1398,7 +1476,8 @@ impl Filesystem for BlossomFS {
                 ino,
                 parent: parent.0,
                 name: name_str.to_string(),
-                data: Vec::new(),
+                storage: WriteStorage::Memory(Vec::new()),
+                hasher: Sha256::new(),
                 flushed: false,
                 append: flags & 0o2000 != 0,
             },
@@ -2059,6 +2138,8 @@ mod tests {
             0,
             Arc::new(crate::payment::NoPayment),
             50 * 1024 * 1024,
+            64 * 1024 * 1024,
+            Arc::new(tokio::sync::Semaphore::new(5)),
         );
         (rt, fs)
     }
@@ -2079,7 +2160,8 @@ mod tests {
                     ino: 5,
                     parent: 1,
                     name: "test.txt".to_string(),
-                    data: Vec::new(),
+                    storage: WriteStorage::Memory(Vec::new()),
+                    hasher: Sha256::new(),
                     flushed: false,
                     append: false,
                 },
@@ -2092,8 +2174,11 @@ mod tests {
             let buf = state.get_mut(&fh).expect("buffer should exist");
             let data = b"hello";
             let end = data.len();
-            buf.data.resize(end, 0);
-            buf.data[0..end].copy_from_slice(data);
+            buf.hasher.update(data);
+            if let WriteStorage::Memory(v) = &mut buf.storage {
+                v.resize(end, 0);
+                v[0..end].copy_from_slice(data);
+            }
         }
 
         // Simulate write at offset 5: " world"
@@ -2102,16 +2187,21 @@ mod tests {
             let buf = state.get_mut(&fh).expect("buffer should exist");
             let data = b" world";
             let end = 5 + data.len();
-            buf.data.resize(end, 0);
-            buf.data[5..end].copy_from_slice(data);
+            buf.hasher.update(data);
+            if let WriteStorage::Memory(v) = &mut buf.storage {
+                v.resize(end, 0);
+                v[5..end].copy_from_slice(data);
+            }
         }
 
         // Verify accumulated data
         {
             let state = fs.write_state.lock().unwrap();
             let buf = state.get(&fh).expect("buffer should exist");
-            assert_eq!(buf.data, b"hello world");
-            assert_eq!(buf.data.len(), 11);
+            if let WriteStorage::Memory(v) = &buf.storage {
+                assert_eq!(v.as_slice(), b"hello world");
+                assert_eq!(v.len(), 11);
+            }
         }
     }
 
@@ -2321,11 +2411,17 @@ mod tests {
         let (_rt, fs) = make_rw_fs();
 
         // Add a file (simulates a failed upload)
+        let failed_data = b"lost data".to_vec();
         let buf = WriteBuffer {
             ino: 5,
             parent: 1,
             name: "failed.bin".to_string(),
-            data: b"lost data".to_vec(),
+            storage: WriteStorage::Memory(failed_data.clone()),
+            hasher: {
+                let mut h = Sha256::new();
+                h.update(&failed_data);
+                h
+            },
             flushed: false,
             append: false,
         };
@@ -2784,9 +2880,11 @@ mod tests {
             0,
             Arc::new(crate::payment::NoPayment),
             50 * 1024 * 1024,
+            64 * 1024 * 1024,
+            Arc::new(tokio::sync::Semaphore::new(5)),
         );
 
-        let result = fs.do_upload(ino, data);
+        let result = fs.do_upload(ino, data, &hash);
         assert!(result.is_ok(), "dedup should succeed without uploading");
     }
 
@@ -2843,9 +2941,11 @@ mod tests {
             0,
             Arc::new(crate::payment::NoPayment),
             50 * 1024 * 1024,
+            64 * 1024 * 1024,
+            Arc::new(tokio::sync::Semaphore::new(5)),
         );
 
-        let result = fs.do_upload(ino, data);
+        let result = fs.do_upload(ino, data, &hash);
         assert!(result.is_err(), "preflight 413 should reject upload");
     }
 
@@ -2908,9 +3008,11 @@ mod tests {
             0,
             Arc::new(crate::payment::NoPayment),
             50 * 1024 * 1024,
+            64 * 1024 * 1024,
+            Arc::new(tokio::sync::Semaphore::new(5)),
         );
 
-        let result = fs.do_upload(ino, data);
+        let result = fs.do_upload(ino, data, &hash);
         assert!(
             result.is_ok(),
             "preflight error should not block upload (advisory)"

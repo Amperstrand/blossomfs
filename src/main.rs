@@ -644,6 +644,10 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
                     args.max_cache_size * 1024 * 1024,
                     payment,
                     (args.multipart_threshold_mb as usize) * 1024 * 1024,
+                    (args.write_buffer_mb as usize) * 1024 * 1024,
+                    Arc::new(tokio::sync::Semaphore::new(
+                        args.max_concurrent_uploads as usize,
+                    )),
                 ),
                 true,
             )

@@ -337,6 +337,12 @@ pub struct MountArgs {
     #[arg(long, default_value_t = 50)]
     pub multipart_threshold_mb: u64,
 
+    #[arg(long, default_value_t = 64)]
+    pub write_buffer_mb: u64,
+
+    #[arg(long, default_value_t = 5)]
+    pub max_concurrent_uploads: u32,
+
     #[arg(long, default_value_t = 30)]
     pub free_period_days: u64,
 
@@ -394,6 +400,8 @@ impl Default for MountArgs {
             ttl_secs: 31536000,
             max_write_mb: 1024,
             multipart_threshold_mb: 50,
+            write_buffer_mb: 64,
+            max_concurrent_uploads: 5,
             free_period_days: 30,
             max_free_size_mb: 1,
             max_cache_size: 0,
