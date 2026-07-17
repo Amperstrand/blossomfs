@@ -443,4 +443,26 @@ mod tests {
             "cache size {total} exceeds limit {max_bytes} + tolerance"
         );
     }
+
+    #[test]
+    fn test_graceful_degradation_serves_stale_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let sha = format!("{:064x}", 0xBEEF_u128);
+
+        write_cache_file(dir.path(), &sha, b"stale but valid", 0);
+
+        assert!(cache_exists(dir.path(), &sha));
+
+        let data = read_cached(dir.path(), &sha).unwrap();
+        assert_eq!(data, b"stale but valid");
+    }
+
+    #[test]
+    fn test_graceful_degradation_missing_cache_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let sha = format!("{:064x}", 0xDEAD_u128);
+
+        assert!(!cache_exists(dir.path(), &sha));
+        assert!(read_cached(dir.path(), &sha).is_err());
+    }
 }

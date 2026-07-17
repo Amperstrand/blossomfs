@@ -356,6 +356,15 @@ impl BlossomFS {
 
                     tracing::debug!("fetching blob {} from {}", sha256, url);
 
+                    if crate::cache::object_cache::cache_exists(cache_base, &sha256) {
+                        tracing::debug!("cache hit for {}, skipping fetch", sha256);
+                        if let Ok(cached) =
+                            crate::cache::object_cache::read_cached(cache_base, &sha256)
+                        {
+                            return Ok(cached);
+                        }
+                    }
+
                     let (map, cvar) = &*self.fetch_in_progress;
                     {
                         let mut guard = map.lock().unwrap();
@@ -378,7 +387,21 @@ impl BlossomFS {
                         cvar.notify_all();
                     }
 
-                    let (full_data, expiry) = fetch_result?;
+                    let (full_data, expiry) = match fetch_result {
+                        Ok(data) => data,
+                        Err(_) => {
+                            match crate::cache::object_cache::read_cached(cache_base, &sha256) {
+                                Ok(cached) => {
+                                    tracing::warn!(
+                                        "server unreachable, serving {} from stale cache",
+                                        sha256
+                                    );
+                                    (cached, None)
+                                }
+                                Err(_) => return Err(ReadError::Fetch),
+                            }
+                        }
+                    };
 
                     if self.max_cache_bytes > 0
                         && let Err(e) = crate::cache::object_cache::evict_oldest(
