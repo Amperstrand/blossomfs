@@ -74,13 +74,25 @@ impl BlossomClient {
 
     const MAX_PAGES: usize = 10_000;
 
-    /// Create a new client for the given base URL (e.g. "https://cdn.example.com").
-    /// Trailing slashes are stripped.
+    /// Create a new client without a timeout (for tests and CLI commands).
     pub fn new(base_url: impl Into<String>) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         Self {
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("failed to build HTTP client"),
+            base_url,
+        }
+    }
+
+    /// Create a new client with a custom HTTP timeout.
+    pub fn with_timeout(base_url: impl Into<String>, timeout: std::time::Duration) -> Self {
+        let base_url = base_url.into().trim_end_matches('/').to_string();
+        Self {
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(timeout)
                 .build()
                 .expect("failed to build HTTP client"),
             base_url,

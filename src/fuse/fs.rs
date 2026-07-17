@@ -111,6 +111,7 @@ pub struct BlossomFS {
     multipart_threshold: usize,
     spill_threshold: usize,
     upload_sem: Arc<tokio::sync::Semaphore>,
+    http_timeout: Duration,
     /// Sha256 hashes currently being fetched. Prevents duplicate HTTP
     /// downloads when multiple FUSE read() calls hit the same uncached blob.
     fetch_in_progress: Arc<(Mutex<HashSet<String>>, Condvar)>,
@@ -139,6 +140,7 @@ impl BlossomFS {
             multipart_threshold: 50 * 1024 * 1024,
             spill_threshold: 64 * 1024 * 1024,
             upload_sem: Arc::new(tokio::sync::Semaphore::new(5)),
+            http_timeout: Duration::from_secs(30),
             fetch_in_progress: Arc::new((Mutex::new(HashSet::new()), Condvar::new())),
             frozen: Arc::new(AtomicBool::new(false)),
             payment: Arc::new(crate::payment::NoPayment),
@@ -177,6 +179,7 @@ impl BlossomFS {
             multipart_threshold: 50 * 1024 * 1024,
             spill_threshold: 64 * 1024 * 1024,
             upload_sem: Arc::new(tokio::sync::Semaphore::new(5)),
+            http_timeout: Duration::from_secs(30),
             fetch_in_progress: Arc::new((Mutex::new(HashSet::new()), Condvar::new())),
             frozen: Arc::new(AtomicBool::new(false)),
             payment: Arc::new(crate::payment::NoPayment),
@@ -222,10 +225,15 @@ impl BlossomFS {
             multipart_threshold,
             spill_threshold,
             upload_sem,
+            http_timeout: Duration::from_secs(30),
             fetch_in_progress: Arc::new((Mutex::new(HashSet::new()), Condvar::new())),
             frozen: Arc::new(AtomicBool::new(false)),
             payment,
         }
+    }
+
+    pub fn set_http_timeout(&mut self, timeout: Duration) {
+        self.http_timeout = timeout;
     }
 
     /// Get a handle to the tree for post-unmount extraction.
@@ -547,7 +555,7 @@ impl BlossomFS {
             }
         };
 
-        let client = BlossomClient::new(server_url);
+        let client = BlossomClient::with_timeout(server_url, self.http_timeout);
 
         // ── Dedup: skip upload if blob already exists (BUD-01) ──
         match handle.block_on(client.head_blob_with_expiry(sha256_hex)) {
@@ -1144,7 +1152,7 @@ impl Filesystem for BlossomFS {
             {
                 match create_delete_auth_header(keys, sha256) {
                     Ok(auth_header) => {
-                        let client = BlossomClient::new(server_url);
+                        let client = BlossomClient::with_timeout(server_url, self.http_timeout);
                         if let Err(e) = handle.block_on(client.delete_blob(sha256, &auth_header)) {
                             tracing::warn!("server delete failed for {}: {}", sha256, e);
                         }

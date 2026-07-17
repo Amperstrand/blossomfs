@@ -627,7 +627,7 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Create filesystem with appropriate constructor
     let handle = rt.handle().clone();
-    let (fs, is_rw) = match (keys, server_url, args.read_only) {
+    let (mut fs, is_rw) = match (keys, server_url, args.read_only) {
         (Some(k), Some(s), false) => {
             tracing::info!("mounting in RW mode (upload server: {})", s);
             (
@@ -668,6 +668,8 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
             )
         }
     };
+
+    fs.set_http_timeout(Duration::from_secs(args.http_timeout_secs));
 
     // Mount options — RW mode omits RO flag
     let mut options = fuser::Config::default();
