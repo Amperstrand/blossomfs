@@ -1884,4 +1884,128 @@ mod tests {
 
         assert!(result.is_ok());
     }
+
+    #[tokio::test]
+    async fn p01_payment_flow_402_then_success() {
+        use crate::payment::PaymentError;
+        use crate::payment::PaymentStrategy;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        struct MockPayment;
+        impl PaymentStrategy for MockPayment {
+            fn pay(&self, _request: &str) -> Result<String, PaymentError> {
+                Ok("cashuBmocktoken123".to_string())
+            }
+        }
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(402).insert_header("X-Cashu", "creqAabc123"))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload"))
+            .and(header("X-Cashu", "cashuBmocktoken123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "url": "https://example.com/abc",
+                "sha256": "abc",
+                "size": 9,
+                "type": "application/octet-stream",
+                "uploaded": 1700000000
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client
+            .upload_blob_with_payment(b"test data".to_vec(), "Nostr tok", &MockPayment)
+            .await;
+
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+        let desc = result.unwrap();
+        assert_eq!(desc.sha256, "abc");
+    }
+
+    #[tokio::test]
+    async fn p02_payment_flow_passes_xcashu_to_strategy() {
+        use crate::payment::PaymentError;
+        use crate::payment::PaymentStrategy;
+        use std::sync::{Arc, Mutex};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        struct CapturingPayment(Arc<Mutex<String>>);
+        impl PaymentStrategy for CapturingPayment {
+            fn pay(&self, request: &str) -> Result<String, PaymentError> {
+                *self.0.lock().unwrap() = request.to_string();
+                Ok("cashuBtoken".to_string())
+            }
+        }
+
+        let mock_server = MockServer::start().await;
+        let captured = Arc::new(Mutex::new(String::new()));
+
+        Mock::given(method("PUT"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(402).insert_header("X-Cashu", "creqAspecific123"))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "url": "https://example.com/def",
+                "sha256": "def",
+                "size": 5,
+                "type": "application/octet-stream",
+                "uploaded": 1700000000
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let strategy = CapturingPayment(captured.clone());
+        let _ = client
+            .upload_blob_with_payment(b"hello".to_vec(), "Nostr tok", &strategy)
+            .await;
+
+        let got = captured.lock().unwrap().clone();
+        assert_eq!(got, "creqAspecific123");
+    }
+
+    #[tokio::test]
+    async fn p03_payment_not_needed_succeeds_directly() {
+        use crate::payment::NoPayment;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "url": "https://example.com/ghi",
+                "sha256": "ghi",
+                "size": 3,
+                "type": "application/octet-stream",
+                "uploaded": 1700000000
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client
+            .upload_blob_with_payment(b"abc".to_vec(), "Nostr tok", &NoPayment)
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().sha256, "ghi");
+    }
 }
