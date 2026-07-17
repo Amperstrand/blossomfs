@@ -173,9 +173,14 @@ impl BlossomConfig {
 }
 
 pub fn validate_args(args: &cli::MountArgs) -> Result<(), ConfigError> {
-    if args.npub.is_empty() && args.pubkey.is_empty() && args.manifest.is_none() {
+    if args.npub.is_empty()
+        && args.pubkey.is_empty()
+        && args.manifest.is_none()
+        && args.nip34_pubkey.is_none()
+    {
         return Err(ConfigError::Validation(
-            "at least one of --npub, --pubkey, or --manifest must be provided".into(),
+            "at least one of --npub, --pubkey, --manifest, or --nip34-pubkey must be provided"
+                .into(),
         ));
     }
 
