@@ -58,6 +58,8 @@ pub enum ConfigError {
     Parse(String, #[source] toml::de::Error),
     #[error("configuration error: {0}")]
     Figment(String),
+    #[error("validation error: {0}")]
+    Validation(String),
 }
 
 impl BlossomConfig {
@@ -168,6 +170,62 @@ impl BlossomConfig {
             args.multipart_threshold_mb = v;
         }
     }
+}
+
+pub fn validate_args(args: &cli::MountArgs) -> Result<(), ConfigError> {
+    if args.npub.is_empty() && args.pubkey.is_empty() && args.manifest.is_none() {
+        return Err(ConfigError::Validation(
+            "at least one of --npub, --pubkey, or --manifest must be provided".into(),
+        ));
+    }
+
+    for n in &args.npub {
+        if !n.starts_with("npub1") && !is_hex_64(n) {
+            return Err(ConfigError::Validation(format!(
+                "invalid npub '{n}': must start with 'npub1' or be 64-char hex"
+            )));
+        }
+    }
+
+    for p in &args.pubkey {
+        if !is_hex_64(p) {
+            return Err(ConfigError::Validation(format!(
+                "invalid pubkey '{p}': must be 64-char hexadecimal"
+            )));
+        }
+    }
+
+    for s in &args.server {
+        if !s.starts_with("http://") && !s.starts_with("https://") {
+            return Err(ConfigError::Validation(format!(
+                "invalid server URL '{s}': must start with http:// or https://"
+            )));
+        }
+    }
+
+    for r in &args.relay {
+        if !r.starts_with("ws://") && !r.starts_with("wss://") {
+            return Err(ConfigError::Validation(format!(
+                "invalid relay URL '{r}': must start with ws:// or wss://"
+            )));
+        }
+    }
+
+    if !args.read_only && args.server.is_empty() {
+        return Err(ConfigError::Validation(
+            "read-write mode requires --server URL".into(),
+        ));
+    }
+
+    if args.ttl_secs == 0 {
+        return Err(ConfigError::Validation("ttl-secs must be > 0".into()));
+    }
+
+    Ok(())
+}
+
+fn is_hex_64(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -375,5 +433,82 @@ read_only = false
             std::env::remove_var("BLOSSOMFS_TTL_SECS");
         }
         assert_ne!(args.ttl_secs, 99);
+    }
+
+    #[test]
+    fn v1_validate_rejects_no_identity() {
+        let args = cli::MountArgs {
+            mountpoint: PathBuf::new(),
+            ..default_args()
+        };
+        let err = validate_args(&args).unwrap_err();
+        assert!(err.to_string().contains("npub"));
+    }
+
+    #[test]
+    fn v2_validate_accepts_valid_npub() {
+        let mut args = default_args();
+        args.npub = vec!["npub1valid".to_string()];
+        validate_args(&args).unwrap();
+    }
+
+    #[test]
+    fn v3_validate_accepts_valid_hex_pubkey() {
+        let mut args = default_args();
+        args.pubkey = vec!["a".repeat(64)];
+        validate_args(&args).unwrap();
+    }
+
+    #[test]
+    fn v4_validate_rejects_short_pubkey() {
+        let mut args = default_args();
+        args.pubkey = vec!["abc".to_string()];
+        let err = validate_args(&args).unwrap_err();
+        assert!(err.to_string().contains("64-char"));
+    }
+
+    #[test]
+    fn v5_validate_rejects_bad_server_url() {
+        let mut args = default_args();
+        args.npub = vec!["npub1test".to_string()];
+        args.server = vec!["ftp://bad.example.com".to_string()];
+        let err = validate_args(&args).unwrap_err();
+        assert!(err.to_string().contains("http"));
+    }
+
+    #[test]
+    fn v6_validate_rejects_rw_without_server() {
+        let mut args = default_args();
+        args.npub = vec!["npub1test".to_string()];
+        args.read_only = false;
+        let err = validate_args(&args).unwrap_err();
+        assert!(err.to_string().contains("server"));
+    }
+
+    #[test]
+    fn v7_validate_accepts_rw_with_server() {
+        let mut args = default_args();
+        args.npub = vec!["npub1test".to_string()];
+        args.read_only = false;
+        args.server = vec!["https://blossom.example.com".to_string()];
+        validate_args(&args).unwrap();
+    }
+
+    #[test]
+    fn v8_validate_rejects_bad_relay_url() {
+        let mut args = default_args();
+        args.npub = vec!["npub1test".to_string()];
+        args.relay = vec!["https://not-a-relay.com".to_string()];
+        let err = validate_args(&args).unwrap_err();
+        assert!(err.to_string().contains("ws://"));
+    }
+
+    #[test]
+    fn v9_validate_rejects_zero_ttl() {
+        let mut args = default_args();
+        args.npub = vec!["npub1test".to_string()];
+        args.ttl_secs = 0;
+        let err = validate_args(&args).unwrap_err();
+        assert!(err.to_string().contains("ttl"));
     }
 }

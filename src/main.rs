@@ -217,6 +217,8 @@ fn run_extend(args: cli::ExtendArgs) -> Result<(), Box<dyn std::error::Error>> {
 fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("blossomfs mounting at {:?}", args.mountpoint);
 
+    config::validate_args(&args)?;
+
     // Verify mountpoint exists
     if !Path::new(&args.mountpoint).exists() {
         return Err(format!("mountpoint {:?} does not exist", args.mountpoint).into());
