@@ -8,7 +8,9 @@
 
 #![allow(dead_code)]
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::path::Path;
 use thiserror::Error;
 
 use crate::blossom::descriptor::BlobDescriptor;
@@ -28,6 +30,8 @@ pub enum BlossomClientError {
     PaymentRequired { x_cashu: String },
     #[error("payment error: {0}")]
     Payment(#[from] crate::payment::PaymentError),
+    #[error("IO error: {0}")]
+    Io(String),
 }
 
 /// Response from BUD-12 list endpoint.
@@ -53,6 +57,78 @@ pub struct MultipartUploadInit {
 pub struct MultipartPartResponse {
     pub part_number: u32,
     pub etag: String,
+}
+
+/// Persisted multipart upload session for resume after interruption.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MultipartSession {
+    pub upload_id: String,
+    pub sha256: String,
+    pub chunk_size: u64,
+    pub total_chunks: u32,
+    pub uploaded_parts: HashSet<u32>,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
+impl MultipartSession {
+    pub fn from_init(init: &MultipartUploadInit, sha256: &str) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Self {
+            upload_id: init.upload_id.clone(),
+            sha256: sha256.to_string(),
+            chunk_size: init.chunk_size,
+            total_chunks: init.total_chunks,
+            uploaded_parts: HashSet::new(),
+            created_at: now,
+            expires_at: now + init.expires_in,
+        }
+    }
+
+    pub fn is_expired(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        now > self.expires_at
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.uploaded_parts.len() as u32 == self.total_chunks
+    }
+
+    pub fn save(&self, session_dir: &Path) -> Result<(), BlossomClientError> {
+        std::fs::create_dir_all(session_dir)
+            .map_err(|e| BlossomClientError::Io(format!("session dir create failed: {e}")))?;
+        let path = session_dir.join(format!("{}.json", self.sha256));
+        let json = serde_json::to_string(self)?;
+        std::fs::write(&path, json)
+            .map_err(|e| BlossomClientError::Io(format!("session write failed: {e}")))?;
+        Ok(())
+    }
+
+    pub fn load(session_dir: &Path, sha256: &str) -> Result<Option<Self>, BlossomClientError> {
+        let path = session_dir.join(format!("{sha256}.json"));
+        if !path.exists() {
+            return Ok(None);
+        }
+        let json = std::fs::read_to_string(&path)
+            .map_err(|e| BlossomClientError::Io(format!("session read failed: {e}")))?;
+        let session: Self = serde_json::from_str(&json)?;
+        if session.is_expired() {
+            let _ = std::fs::remove_file(&path);
+            return Ok(None);
+        }
+        Ok(Some(session))
+    }
+
+    pub fn delete(session_dir: &Path, sha256: &str) {
+        let path = session_dir.join(format!("{sha256}.json"));
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 /// Result of HEAD /<sha256> existence + expiry check.
@@ -541,21 +617,81 @@ impl BlossomClient {
         content_type: &str,
         auth_header: &str,
     ) -> Result<BlobDescriptor, BlossomClientError> {
-        let init = self
-            .init_multipart_upload(data.len() as u64, content_type, auth_header)
-            .await?;
+        self.upload_blob_multipart_resumable(data, content_type, auth_header, None, None)
+            .await
+    }
 
-        let chunk_size = init.chunk_size as usize;
-        for part_num in 1..=init.total_chunks {
+    /// Upload a blob using multipart with session persistence for resume.
+    ///
+    /// If `session_dir` and `sha256_hex` are provided, the method:
+    /// 1. Checks for an existing session (resume after interruption)
+    /// 2. Skips parts that were already uploaded
+    /// 3. Persists progress after each part
+    /// 4. Cleans up the session file on completion
+    pub async fn upload_blob_multipart_resumable(
+        &self,
+        data: &[u8],
+        content_type: &str,
+        auth_header: &str,
+        session_dir: Option<&Path>,
+        sha256_hex: Option<&str>,
+    ) -> Result<BlobDescriptor, BlossomClientError> {
+        let sha256_hex = sha256_hex.unwrap_or("");
+        let session_dir = session_dir.map(|p| p.join("multipart_sessions"));
+
+        let mut session = if let Some(ref dir) = session_dir {
+            if let Some(existing) = MultipartSession::load(dir, sha256_hex)? {
+                tracing::info!(
+                    "resuming multipart upload {} ({}/{})",
+                    existing.upload_id,
+                    existing.uploaded_parts.len(),
+                    existing.total_chunks
+                );
+                existing
+            } else {
+                let init = self
+                    .init_multipart_upload(data.len() as u64, content_type, auth_header)
+                    .await?;
+                let s = MultipartSession::from_init(&init, sha256_hex);
+                s.save(dir)?;
+                s
+            }
+        } else {
+            let init = self
+                .init_multipart_upload(data.len() as u64, content_type, auth_header)
+                .await?;
+            MultipartSession::from_init(&init, sha256_hex)
+        };
+
+        let chunk_size = session.chunk_size as usize;
+        for part_num in 1..=session.total_chunks {
+            if session.uploaded_parts.contains(&part_num) {
+                continue;
+            }
+
             let offset = (part_num as usize - 1) * chunk_size;
             let end = std::cmp::min(offset + chunk_size, data.len());
             let chunk = data[offset..end].to_vec();
-            self.upload_multipart_part(&init.upload_id, part_num, chunk, auth_header)
+
+            self.upload_multipart_part(&session.upload_id, part_num, chunk, auth_header)
                 .await?;
+
+            session.uploaded_parts.insert(part_num);
+
+            if let Some(ref dir) = session_dir {
+                let _ = session.save(dir);
+            }
         }
 
-        self.complete_multipart_upload(&init.upload_id, auth_header)
-            .await
+        let descriptor = self
+            .complete_multipart_upload(&session.upload_id, auth_header)
+            .await?;
+
+        if let Some(ref dir) = session_dir {
+            MultipartSession::delete(dir, sha256_hex);
+        }
+
+        Ok(descriptor)
     }
 
     /// Check if a blob exists on the server (BUD-01).
@@ -2007,5 +2143,175 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap().sha256, "ghi");
+    }
+
+    #[test]
+    fn m01_session_save_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path();
+
+        let init = MultipartUploadInit {
+            upload_id: "test123".to_string(),
+            sha256: "abc".to_string(),
+            chunk_size: 1024,
+            total_chunks: 3,
+            expires_in: 3600,
+        };
+        let mut session = MultipartSession::from_init(&init, "deadbeef");
+        session.uploaded_parts.insert(1);
+        session.uploaded_parts.insert(2);
+
+        session.save(session_dir).unwrap();
+
+        let loaded = MultipartSession::load(session_dir, "deadbeef").unwrap();
+        assert!(loaded.is_some());
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.upload_id, "test123");
+        assert_eq!(loaded.total_chunks, 3);
+        assert_eq!(loaded.uploaded_parts.len(), 2);
+        assert!(loaded.uploaded_parts.contains(&1));
+        assert!(loaded.uploaded_parts.contains(&2));
+    }
+
+    #[test]
+    fn m02_session_load_missing_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = MultipartSession::load(dir.path(), "nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn m03_session_delete_removes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let init = MultipartUploadInit {
+            upload_id: "test456".to_string(),
+            sha256: "xyz".to_string(),
+            chunk_size: 512,
+            total_chunks: 2,
+            expires_in: 3600,
+        };
+        let session = MultipartSession::from_init(&init, "cafe");
+        session.save(dir.path()).unwrap();
+        assert!(
+            MultipartSession::load(dir.path(), "cafe")
+                .unwrap()
+                .is_some()
+        );
+
+        MultipartSession::delete(dir.path(), "cafe");
+        assert!(
+            MultipartSession::load(dir.path(), "cafe")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn m04_session_is_complete_check() {
+        let init = MultipartUploadInit {
+            upload_id: "test789".to_string(),
+            sha256: "q".to_string(),
+            chunk_size: 100,
+            total_chunks: 3,
+            expires_in: 3600,
+        };
+        let mut session = MultipartSession::from_init(&init, "hash");
+        assert!(!session.is_complete());
+        session.uploaded_parts.insert(1);
+        session.uploaded_parts.insert(2);
+        session.uploaded_parts.insert(3);
+        assert!(session.is_complete());
+    }
+
+    #[tokio::test]
+    async fn m05_resumable_upload_skips_completed_parts() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        let sha = "a".repeat(64);
+
+        let init = MultipartUploadInit {
+            upload_id: "resume-test".to_string(),
+            sha256: sha.clone(),
+            chunk_size: 4,
+            total_chunks: 3,
+            expires_in: 3600,
+        };
+        let mut existing = MultipartSession::from_init(&init, &sha);
+        existing.uploaded_parts.insert(1);
+        existing
+            .save(&dir.path().join("multipart_sessions"))
+            .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/upload/multipart"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "upload_id": "resume-test",
+                "sha256": sha,
+                "chunk_size": 4,
+                "total_chunks": 3,
+                "expires_in": 3600,
+            })))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload/multipart/resume-test"))
+            .and(header("X-Part-Number", "2"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"part_number": 2, "etag": "etag2"})),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path("/upload/multipart/resume-test"))
+            .and(header("X-Part-Number", "3"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"part_number": 3, "etag": "etag3"})),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/upload/multipart/resume-test/complete"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "url": "https://example.com/blob",
+                "sha256": sha,
+                "size": 12,
+                "type": "application/octet-stream",
+                "uploaded": 1700000000,
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let data = b"aaaabbbbcccc".to_vec();
+        let result = client
+            .upload_blob_multipart_resumable(
+                &data,
+                "application/octet-stream",
+                "tok",
+                Some(dir.path()),
+                Some(&sha),
+            )
+            .await;
+
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+
+        assert!(
+            !dir.path()
+                .join("multipart_sessions")
+                .join(format!("{sha}.json"))
+                .exists(),
+            "session file should be deleted after completion"
+        );
     }
 }

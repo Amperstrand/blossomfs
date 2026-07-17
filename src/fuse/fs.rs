@@ -649,10 +649,12 @@ impl BlossomFS {
                 data_len,
                 self.multipart_threshold
             );
-            match handle.block_on(client.upload_blob_multipart(
+            match handle.block_on(client.upload_blob_multipart_resumable(
                 &data,
                 "application/octet-stream",
                 &auth_header,
+                self.cache_base.as_deref(),
+                Some(sha256_hex),
             )) {
                 Ok(desc) => Ok(desc),
                 Err(BlossomClientError::ServerError {
