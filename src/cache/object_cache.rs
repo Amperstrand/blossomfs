@@ -367,4 +367,80 @@ mod tests {
 
         evict_oldest(dir.path(), 1024, "none").unwrap();
     }
+
+    #[test]
+    fn test_concurrent_eviction_no_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+
+        for i in 0..10 {
+            let sha = format!("{i:064x}");
+            write_cache_file(&base, &sha, &[0xAB; 1024], i as u64);
+        }
+
+        let keep_sha = format!("{:064x}", 0xCAFE_u128);
+        write_cache_file(&base, &keep_sha, b"KEEP_ME", 99);
+
+        let base_arc = std::sync::Arc::new(base);
+        let keep_arc = std::sync::Arc::new(keep_sha.clone());
+
+        let mut handles = Vec::new();
+        for t in 0..4u8 {
+            let base = base_arc.clone();
+            let keep = keep_arc.clone();
+            handles.push(std::thread::spawn(move || {
+                for j in 0..5u8 {
+                    let sha = format!("{t:032x}{j:032x}");
+                    write_cache_file(&base, &sha, &[0xCD; 512], 100 + t as u64 * 10 + j as u64);
+                    evict_oldest(&base, 4096, &keep).unwrap();
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        assert!(cache_exists(&base_arc, &keep_sha));
+    }
+
+    #[test]
+    fn test_concurrent_eviction_respects_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+
+        for i in 0..20 {
+            let sha = format!("{i:064x}");
+            write_cache_file(&base, &sha, &[0xAA; 2048], i as u64);
+        }
+
+        let base_arc = std::sync::Arc::new(base);
+        let max_bytes = 8192u64;
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let base = base_arc.clone();
+            handles.push(std::thread::spawn(move || {
+                evict_oldest(&base, max_bytes, "nonexistent").unwrap();
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        let objects_dir = base_arc.join("objects");
+        let mut total: u64 = 0;
+        for entry in walkdir::WalkDir::new(&objects_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+        {
+            total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+        }
+        assert!(
+            total <= max_bytes + 2048,
+            "cache size {total} exceeds limit {max_bytes} + tolerance"
+        );
+    }
 }
