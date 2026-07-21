@@ -12,6 +12,7 @@ mod config;
 mod control;
 mod fuse;
 mod git;
+mod metrics;
 mod nostr;
 mod payment;
 mod util;
@@ -707,6 +708,11 @@ fn run_mount(args: cli::MountArgs) -> Result<(), Box<dyn std::error::Error>> {
         cache_base,
         fs_read_only,
     ));
+
+    if let Some(port) = args.metrics_port {
+        metrics::init();
+        let _metrics_task = rt.handle().spawn(metrics::start_metrics_server(port));
+    }
 
     fuser::mount2(fs, &args.mountpoint, &options)?;
 

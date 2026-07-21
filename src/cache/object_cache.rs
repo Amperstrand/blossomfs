@@ -117,6 +117,9 @@ pub fn evict_oldest(cache_base: &Path, max_bytes: u64, keep: &str) -> Result<(),
 
     entries.sort_by_key(|(_, _, mtime)| *mtime);
 
+    let mut removed_bytes: i64 = 0;
+    let mut removed_count: i64 = 0;
+
     for (path, size, _) in &entries {
         if total_size <= max_bytes {
             break;
@@ -129,6 +132,8 @@ pub fn evict_oldest(cache_base: &Path, max_bytes: u64, keep: &str) -> Result<(),
         match fs::remove_file(path) {
             Ok(()) => {
                 total_size -= size;
+                removed_bytes += *size as i64;
+                removed_count += 1;
                 tracing::debug!(
                     "evicted {:?} ({} bytes, {} remaining)",
                     path,
@@ -140,6 +145,11 @@ pub fn evict_oldest(cache_base: &Path, max_bytes: u64, keep: &str) -> Result<(),
                 tracing::warn!("failed to evict {:?}: {}", path, e);
             }
         }
+    }
+
+    if removed_bytes > 0 || removed_count > 0 {
+        crate::metrics::CACHE_SIZE_BYTES.sub(removed_bytes);
+        crate::metrics::CACHE_FILE_COUNT.sub(removed_count);
     }
 
     Ok(())

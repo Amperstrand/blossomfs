@@ -23,6 +23,7 @@ const ENV_FIELDS: &[&str] = &[
     "max_free_size_mb",
     "max_cache_size",
     "multipart_threshold_mb",
+    "metrics_port",
 ];
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -48,6 +49,7 @@ pub struct BlossomConfig {
     pub max_free_size_mb: Option<u64>,
     pub max_cache_size: Option<u64>,
     pub multipart_threshold_mb: Option<u64>,
+    pub metrics_port: Option<u16>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -168,6 +170,11 @@ impl BlossomConfig {
             && let Some(v) = self.multipart_threshold_mb
         {
             args.multipart_threshold_mb = v;
+        }
+        if !is_explicit("metrics-port")
+            && let Some(v) = self.metrics_port
+        {
+            args.metrics_port = Some(v);
         }
     }
 }
@@ -438,6 +445,25 @@ read_only = false
             std::env::remove_var("BLOSSOMFS_TTL_SECS");
         }
         assert_ne!(args.ttl_secs, 99);
+    }
+
+    #[test]
+    fn s16_config_metrics_port_default() {
+        let cfg = BlossomConfig::default();
+        assert_eq!(cfg.metrics_port, None);
+    }
+
+    #[test]
+    fn s17_config_env_var_metrics_port() {
+        unsafe {
+            std::env::set_var("BLOSSOMFS_METRICS_PORT", "9999");
+        }
+        let mut args = default_args();
+        BlossomConfig::load_merged(None, &mut args, |_| false).unwrap();
+        unsafe {
+            std::env::remove_var("BLOSSOMFS_METRICS_PORT");
+        }
+        assert_eq!(args.metrics_port, Some(9999));
     }
 
     #[test]

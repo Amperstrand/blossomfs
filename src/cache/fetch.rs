@@ -51,12 +51,27 @@ pub async fn fetch_and_cache(
     expected_sha256: &str,
     cache_base: &Path,
 ) -> Result<(Vec<u8>, Option<u64>), FetchError> {
+    let result = fetch_and_cache_inner(url, expected_sha256, cache_base).await;
+    if let Err(ref e) = result {
+        crate::metrics::record_error(crate::metrics::categorize_fetch_error(e));
+    }
+    result
+}
+
+async fn fetch_and_cache_inner(
+    url: &str,
+    expected_sha256: &str,
+    cache_base: &Path,
+) -> Result<(Vec<u8>, Option<u64>), FetchError> {
     // 1. Check cache first — serve from disk if available
     if cache_exists(cache_base, expected_sha256) {
+        crate::metrics::CACHE_HITS.inc();
         return read_cached(cache_base, expected_sha256)
             .map(|bytes| (bytes, None))
             .map_err(FetchError::Cache);
     }
+
+    crate::metrics::CACHE_MISSES.inc();
 
     // 2a. Download with retry — exponential backoff on transient failures.
     //     Redirect policy: none (security — never follow redirects from blob servers)
@@ -97,6 +112,8 @@ pub async fn fetch_and_cache(
         });
 
     let bytes = resp.bytes().await?;
+    crate::metrics::DOWNLOADS_TOTAL.inc();
+    crate::metrics::DOWNLOADS_BYTES.inc_by(bytes.len() as u64);
 
     // Double-check actual byte count (Content-Length can be absent or lie)
     if bytes.len() as u64 > MAX_BLOB_SIZE {
@@ -127,6 +144,9 @@ pub async fn fetch_and_cache(
     let mut temp = tempfile::NamedTempFile::new_in(&tmp_dir)?;
     temp.write_all(bytes.as_ref())?;
     temp.persist(&cache_file).map_err(|e| e.error)?;
+
+    crate::metrics::CACHE_SIZE_BYTES.add(bytes.len() as i64);
+    crate::metrics::CACHE_FILE_COUNT.inc();
 
     Ok((bytes.to_vec(), sunset_ts))
 }

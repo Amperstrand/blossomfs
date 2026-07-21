@@ -282,7 +282,10 @@ impl BlossomClient {
         }
 
         let bytes = response.bytes().await?;
-        Ok(bytes.to_vec())
+        let bytes_vec = bytes.to_vec();
+        crate::metrics::DOWNLOADS_TOTAL.inc();
+        crate::metrics::DOWNLOADS_BYTES.inc_by(bytes_vec.len() as u64);
+        Ok(bytes_vec)
     }
 
     /// Upload a blob using BUD-02.
@@ -310,6 +313,7 @@ impl BlossomClient {
         auth_header: &str,
     ) -> Result<BlobDescriptor, BlossomClientError> {
         let url = format!("{}/upload", self.base_url);
+        let upload_bytes = data.len() as u64;
 
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
@@ -338,6 +342,8 @@ impl BlossomClient {
 
         let body = response.text().await?;
         let descriptor: BlobDescriptor = serde_json::from_str(&body)?;
+        crate::metrics::UPLOADS_TOTAL.inc();
+        crate::metrics::UPLOADS_BYTES.inc_by(upload_bytes);
         Ok(descriptor)
     }
 
@@ -403,6 +409,8 @@ impl BlossomClient {
 
         if status.is_success() {
             let body = response.text().await?;
+            crate::metrics::UPLOADS_TOTAL.inc();
+            crate::metrics::UPLOADS_BYTES.inc_by(data.len() as u64);
             return Ok(serde_json::from_str(&body)?);
         }
 

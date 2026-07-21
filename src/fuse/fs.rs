@@ -551,6 +551,7 @@ impl BlossomFS {
     /// auth-creation errors return immediately. Returns `Err(())` on final
     /// failure — caller is responsible for cleanup.
     fn do_upload(&self, ino: u64, data: Vec<u8>, sha256_hex: &str) -> Result<(), ()> {
+        let _upload_guard = crate::metrics::ActiveUploadGuard::new();
         let (keys, server_url, handle) = match (&self.keys, &self.server_url, &self.runtime_handle)
         {
             (Some(k), Some(s), Some(h)) => (k, s, h),

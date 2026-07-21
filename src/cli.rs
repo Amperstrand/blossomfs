@@ -371,6 +371,10 @@ pub struct MountArgs {
     #[arg(long, default_value_t = 1000)]
     pub max_blobs: u64,
 
+    /// Metrics server port (default: disabled). Enables prometheus metrics endpoint.
+    #[arg(long)]
+    pub metrics_port: Option<u16>,
+
     #[arg(long)]
     pub config: Option<PathBuf>,
 
@@ -411,6 +415,7 @@ impl Default for MountArgs {
             max_cache_size: 0,
             persist: None,
             max_blobs: 1000,
+            metrics_port: None,
             config: None,
             daemon: false,
             cashu_token_file: None,
