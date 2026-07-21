@@ -381,6 +381,65 @@ impl BlossomClient {
         Ok(())
     }
 
+    /// Mirror a blob from another server (BUD-04).
+    ///
+    /// `PUT /mirror`
+    ///
+    /// The server fetches the blob from `source_url` and stores it locally.
+    ///
+    /// # Headers
+    ///
+    /// - `Authorization: Nostr <auth_header>` (base64url-encoded signed event)
+    /// - `Content-Type: application/json`
+    ///
+    /// # Body
+    ///
+    /// ```json
+    /// { "url": "<source_url>" }
+    /// ```
+    ///
+    /// # Arguments
+    ///
+    /// * `source_url` - URL of the blob on another Blossom server to mirror.
+    /// * `auth_header` - Base64url-encoded signed BUD-11 auth event (without
+    ///   the `Nostr ` prefix — this method adds it).
+    ///
+    /// # Returns
+    ///
+    /// The blob descriptor for the newly mirrored blob, or
+    /// `BlossomClientError::ServerError` on non-2xx responses.
+    pub async fn mirror_blob(
+        &self,
+        source_url: &str,
+        auth_header: &str,
+    ) -> Result<BlobDescriptor, BlossomClientError> {
+        let url = format!("{}/mirror", self.base_url);
+        let body = serde_json::json!({ "url": source_url }).to_string();
+
+        let response = self
+            .client
+            .put(&url)
+            .header("Authorization", format!("Nostr {auth_header}"))
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await?;
+
+        let status = response.status();
+
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(BlossomClientError::ServerError {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        let body = response.text().await?;
+        let descriptor: BlobDescriptor = serde_json::from_str(&body)?;
+        Ok(descriptor)
+    }
+
     async fn upload_attempt(
         &self,
         data: &[u8],
@@ -812,7 +871,7 @@ impl BlossomClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::matchers::{body_partial_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // ── Helpers ────────────────────────────────────────────────────────────
@@ -2321,5 +2380,133 @@ mod tests {
                 .exists(),
             "session file should be deleted after completion"
         );
+    }
+
+    // ── BUD-04 mirror_blob ─────────────────────────────────────────────────
+
+    // ── Scenario M1: Happy — mirror_blob returns parsed BlobDescriptor ─────
+
+    #[tokio::test]
+    async fn test_mirror_blob_returns_descriptor() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/mirror"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "url": "https://cdn.example.com/abc123",
+                "sha256": "abc123",
+                "size": 1024,
+                "type": "application/octet-stream",
+                "uploaded": 1700000000
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client
+            .mirror_blob("https://server-a.com/abc123", "dummy_auth_token")
+            .await;
+
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+        let desc = result.unwrap();
+        assert_eq!(desc.sha256, "abc123");
+        assert_eq!(desc.size, 1024);
+        assert_eq!(desc.url, "https://cdn.example.com/abc123");
+        assert_eq!(desc.uploaded, 1700000000);
+        assert_eq!(desc.mime_type.as_deref(), Some("application/octet-stream"));
+    }
+
+    // ── Scenario M2: Happy — mirror_blob sends Authorization + Content-Type ─
+
+    #[tokio::test]
+    async fn test_mirror_blob_sends_required_headers() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/mirror"))
+            .and(header("Authorization", "Nostr my_token_123"))
+            .and(header("Content-Type", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "url": "https://cdn.example.com/x",
+                "sha256": "x",
+                "size": 1,
+                "type": "application/octet-stream",
+                "uploaded": 1
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client
+            .mirror_blob("https://src.example.com/x", "my_token_123")
+            .await;
+
+        // If either header didn't match, wiremock returns 404 → result is Err.
+        assert!(
+            result.is_ok(),
+            "expected Ok (headers matched), got {:?}",
+            result.err()
+        );
+    }
+
+    // ── Scenario M3: Happy — mirror_blob sends JSON body { "url": "..." } ───
+
+    #[tokio::test]
+    async fn test_mirror_blob_sends_url_in_body() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/mirror"))
+            .and(body_partial_json(serde_json::json!({
+                "url": "https://server-a.com/blob-deadbeef"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "url": "https://cdn.example.com/blob-deadbeef",
+                "sha256": "deadbeef",
+                "size": 1,
+                "type": "application/octet-stream",
+                "uploaded": 1
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client
+            .mirror_blob("https://server-a.com/blob-deadbeef", "tok")
+            .await;
+
+        // If the JSON body didn't contain the expected url, wiremock 404s.
+        assert!(
+            result.is_ok(),
+            "expected Ok (body url matched), got {:?}",
+            result.err()
+        );
+    }
+
+    // ── Scenario M4: Edge — mirror_blob 404 → ServerError ──────────────────
+
+    #[tokio::test]
+    async fn test_mirror_blob_404_server_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/mirror"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&mock_server)
+            .await;
+
+        let client = BlossomClient::new(mock_server.uri());
+        let result = client
+            .mirror_blob("https://src.example.com/missing", "tok")
+            .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            BlossomClientError::ServerError { status, body } => {
+                assert_eq!(status, 404);
+                assert_eq!(body, "not found");
+            }
+            other => panic!("expected ServerError, got {other:?}"),
+        }
     }
 }
