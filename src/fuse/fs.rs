@@ -361,7 +361,11 @@ impl BlossomFS {
                         if let Ok(cached) =
                             crate::cache::object_cache::read_cached(cache_base, &sha256)
                         {
-                            return Ok(cached);
+                            if offset >= cached.len() {
+                                return Ok(Vec::new());
+                            }
+                            let end = (offset + size).min(cached.len());
+                            return Ok(cached[offset..end].to_vec());
                         }
                     }
 

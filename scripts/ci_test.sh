@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ─── Configuration ──────────────────────────────────────────────────────────
-SERVER="https://blossom.psbt.me"
+SERVER="https://drive.cashu.email"
 MINT="https://testnut.cashu.space"
 CASHU_WALLET="ci-test"
 WORKDIR="/tmp/blossom-ci"
