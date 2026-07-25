@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::cache::fetch::fetch_and_cache;
+use crate::cache::fetch::{fetch_and_cache, fetch_range, verify_and_cache};
 use crate::cache::object_cache::cache_path;
 
 use fuser::{
@@ -354,6 +354,10 @@ impl BlossomFS {
                         _ => return Err(ReadError::Remote),
                     };
 
+                    if size == 0 {
+                        return Ok(Vec::new());
+                    }
+
                     tracing::debug!("fetching blob {} from {}", sha256, url);
 
                     if crate::cache::object_cache::cache_exists(cache_base, &sha256) {
@@ -378,34 +382,104 @@ impl BlossomFS {
                         guard.insert(sha256.clone());
                     }
 
-                    let fetch_result = handle
-                        .block_on(fetch_and_cache(&url, &sha256, cache_base))
-                        .map_err(|e| {
-                            tracing::error!("fetch failed for {}: {}", sha256, e);
-                            ReadError::Fetch
-                        });
+                    if crate::cache::object_cache::cache_exists(cache_base, &sha256) {
+                        {
+                            let mut guard = map.lock().unwrap();
+                            guard.remove(&sha256);
+                            cvar.notify_all();
+                        }
+                        tracing::debug!("cache hit for {} after lock", sha256);
+                        if let Ok(cached) =
+                            crate::cache::object_cache::read_cached(cache_base, &sha256)
+                        {
+                            if offset >= cached.len() {
+                                return Ok(Vec::new());
+                            }
+                            let end = (offset + size).min(cached.len());
+                            return Ok(cached[offset..end].to_vec());
+                        }
+                    }
+
+                    let range_result =
+                        handle.block_on(fetch_range(&url, offset, offset + size - 1));
+
+                    let (full_data, expiry) = match range_result {
+                        Ok((range_data, None)) => {
+                            {
+                                let mut guard = map.lock().unwrap();
+                                guard.remove(&sha256);
+                                cvar.notify_all();
+                            }
+                            tracing::debug!(
+                                "range fetch (206) for {} — {} bytes",
+                                sha256,
+                                range_data.len()
+                            );
+                            return Ok(range_data);
+                        }
+                        Ok((full_blob, Some(_))) => {
+                            tracing::debug!(
+                                "range fetch returned full blob (200) for {} — verifying",
+                                sha256
+                            );
+                            match verify_and_cache(&full_blob, &sha256, cache_base) {
+                                Ok(()) => (full_blob, None),
+                                Err(e) => {
+                                    {
+                                        let mut guard = map.lock().unwrap();
+                                        guard.remove(&sha256);
+                                        cvar.notify_all();
+                                    }
+                                    tracing::warn!("verify_and_cache failed for {}: {}", sha256, e);
+                                    return Err(ReadError::Fetch);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "range fetch failed for {}: {}, falling back to full fetch",
+                                sha256,
+                                e
+                            );
+                            let fetch_result = handle
+                                .block_on(fetch_and_cache(&url, &sha256, cache_base))
+                                .map_err(|err| {
+                                    tracing::error!("fetch failed for {}: {}", sha256, err);
+                                    ReadError::Fetch
+                                });
+
+                            match fetch_result {
+                                Ok((data, exp)) => (data, exp),
+                                Err(_) => {
+                                    match crate::cache::object_cache::read_cached(
+                                        cache_base, &sha256,
+                                    ) {
+                                        Ok(cached) => {
+                                            tracing::warn!(
+                                                "server unreachable, serving {} from stale cache",
+                                                sha256
+                                            );
+                                            (cached, None)
+                                        }
+                                        Err(_) => {
+                                            {
+                                                let mut guard = map.lock().unwrap();
+                                                guard.remove(&sha256);
+                                                cvar.notify_all();
+                                            }
+                                            return Err(ReadError::Fetch);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    };
 
                     {
                         let mut guard = map.lock().unwrap();
                         guard.remove(&sha256);
                         cvar.notify_all();
                     }
-
-                    let (full_data, expiry) = match fetch_result {
-                        Ok(data) => data,
-                        Err(_) => {
-                            match crate::cache::object_cache::read_cached(cache_base, &sha256) {
-                                Ok(cached) => {
-                                    tracing::warn!(
-                                        "server unreachable, serving {} from stale cache",
-                                        sha256
-                                    );
-                                    (cached, None)
-                                }
-                                Err(_) => return Err(ReadError::Fetch),
-                            }
-                        }
-                    };
 
                     if self.max_cache_bytes > 0
                         && let Err(e) = crate::cache::object_cache::evict_oldest(
@@ -2149,6 +2223,100 @@ mod tests {
 
         fs.frozen_handle().store(false, Ordering::Relaxed);
         assert!(!fs.is_frozen(), "should be unfrozen after flag cleared");
+    }
+
+    // ============== S45: Range fetch — small read of uncached blob fetches only the range ==============
+
+    #[test]
+    fn s45_range_fetch_small_read_only_fetches_range() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+
+        let content: Vec<u8> = (0u8..255).cycle().take(10_000).collect();
+        let hash = sha256_hex(&content);
+
+        let (mock_server_uri, mock_server) = rt.block_on(async {
+            use wiremock::matchers::{header, method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            let range_data = &content[1000..1010];
+            Mock::given(method("GET"))
+                .and(path("/large45"))
+                .and(header("Range", "bytes=1000-1009"))
+                .respond_with(
+                    ResponseTemplate::new(206)
+                        .set_body_bytes(range_data.to_vec())
+                        .insert_header("Content-Range", "bytes 1000-1009/10000"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            (server.uri(), server)
+        });
+
+        let url = format!("{}/large45", mock_server_uri);
+        let tree = make_cache_test_tree(url, hash.clone(), content.len() as u64);
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let fs = make_cache_fs(tree, cache_dir.path().to_path_buf(), handle);
+
+        let data = fs
+            .read_content(2, 1000, 10)
+            .expect("range read should succeed");
+
+        assert_eq!(data, &content[1000..1010]);
+
+        assert!(
+            !crate::cache::object_cache::cache_exists(cache_dir.path(), &hash),
+            "blob should NOT be cached after 206 range fetch"
+        );
+
+        drop(mock_server);
+    }
+
+    // ============== S46: Server ignores Range (200) — full blob fetched, verified, cached ==============
+
+    #[test]
+    fn s46_range_fetch_server_returns_200_caches() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+
+        let content = b"server ignores range requests entirely";
+        let hash = sha256_hex(content);
+
+        let (mock_server_uri, mock_server) = rt.block_on(async {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/norange46"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(content.to_vec()))
+                .expect(1)
+                .mount(&server)
+                .await;
+            (server.uri(), server)
+        });
+
+        let url = format!("{}/norange46", mock_server_uri);
+        let tree = make_cache_test_tree(url, hash.clone(), content.len() as u64);
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let fs = make_cache_fs(tree, cache_dir.path().to_path_buf(), handle);
+
+        let data = fs
+            .read_content(2, 5, 10)
+            .expect("read should succeed via 200 fallback");
+
+        assert_eq!(data, &content[5..15]);
+
+        assert!(
+            crate::cache::object_cache::cache_exists(cache_dir.path(), &hash),
+            "blob should be cached after 200 response"
+        );
+
+        drop(mock_server);
     }
 
     // ============== Write logic tests (S23+) ==============

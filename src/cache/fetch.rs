@@ -122,12 +122,30 @@ async fn fetch_and_cache_inner(
         });
     }
 
-    // 2c. Compute SHA-256
+    // 2c-2e. Verify SHA-256 and cache atomically
+    verify_and_cache(bytes.as_ref(), expected_sha256, cache_base)?;
+
+    Ok((bytes.to_vec(), sunset_ts))
+}
+
+/// Verify SHA-256 and write blob to cache atomically.
+///
+/// Called after downloading the full blob bytes. Computes SHA-256,
+/// verifies against the expected hash, and writes to the content-addressed
+/// cache via atomic rename (`NamedTempFile::persist`).
+///
+/// On hash mismatch or IO error, no cache file is written.
+pub fn verify_and_cache(
+    bytes: &[u8],
+    expected_sha256: &str,
+    cache_base: &Path,
+) -> Result<(), FetchError> {
+    // Compute SHA-256
     let mut hasher = Sha256::new();
-    hasher.update(bytes.as_ref());
+    hasher.update(bytes);
     let computed = hex::encode(hasher.finalize());
 
-    // 2d. Verify hash (case-insensitive — expected may be uppercase)
+    // Verify hash (case-insensitive — expected may be uppercase)
     if computed != expected_sha256.to_lowercase() {
         return Err(FetchError::HashMismatch {
             expected: expected_sha256.to_string(),
@@ -135,27 +153,113 @@ async fn fetch_and_cache_inner(
         });
     }
 
-    // 2e. Atomic write via NamedTempFile::persist (POSIX rename is atomic on same fs)
+    // Atomic write via NamedTempFile::persist (POSIX rename is atomic on same fs)
     ensure_cache_dir(cache_base, expected_sha256)?;
     let cache_file = cache_path(cache_base, expected_sha256)?;
     let tmp_dir = cache_base.join(".tmp");
     std::fs::create_dir_all(&tmp_dir)?;
 
     let mut temp = tempfile::NamedTempFile::new_in(&tmp_dir)?;
-    temp.write_all(bytes.as_ref())?;
+    temp.write_all(bytes)?;
     temp.persist(&cache_file).map_err(|e| e.error)?;
 
     crate::metrics::CACHE_SIZE_BYTES.add(bytes.len() as i64);
     crate::metrics::CACHE_FILE_COUNT.inc();
 
-    Ok((bytes.to_vec(), sunset_ts))
+    Ok(())
+}
+
+/// Fetch a byte range from a remote blob.
+///
+/// Sends a `Range: bytes={start}-{end}` header. If the server supports
+/// Range requests, it returns 206 with only the requested bytes. If not,
+/// it returns 200 with the full blob.
+///
+/// # Returns
+///
+/// `(range_bytes, full_blob_if_returned)`:
+/// - `(range_bytes, None)` — server returned 206 (Partial Content).
+///   Only the requested range was fetched; SHA-256 cannot be verified.
+/// - `(full_bytes, Some(full_bytes))` — server returned 200 (full blob).
+///   The caller should verify SHA-256 and cache the blob.
+pub async fn fetch_range(
+    url: &str,
+    start: usize,
+    end: usize, // inclusive
+) -> Result<(Vec<u8>, Option<Vec<u8>>), FetchError> {
+    let result = fetch_range_inner(url, start, end).await;
+    if let Err(ref e) = result {
+        crate::metrics::record_error(crate::metrics::categorize_fetch_error(e));
+    }
+    result
+}
+
+async fn fetch_range_inner(
+    url: &str,
+    start: usize,
+    end: usize, // inclusive
+) -> Result<(Vec<u8>, Option<Vec<u8>>), FetchError> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+
+    let range_value = format!("bytes={start}-{end}");
+
+    // Retry on transient failures (same policy as fetch_and_cache_inner).
+    let resp = (|| async {
+        client
+            .get(url)
+            .header("Range", &range_value)
+            .send()
+            .await?
+            .error_for_status()
+    })
+    .retry(ExponentialBuilder::default())
+    .sleep(tokio::time::sleep)
+    .when(|e: &reqwest::Error| {
+        e.is_connect()
+            || e.is_timeout()
+            || e.status()
+                .map(|s| s.is_server_error() || s.as_u16() == 429)
+                .unwrap_or(false)
+    })
+    .await?;
+
+    let status = resp.status().as_u16();
+
+    // Size guard: reject responses larger than MAX_BLOB_SIZE to prevent OOM
+    if let Some(len) = resp.content_length()
+        && len > MAX_BLOB_SIZE
+    {
+        return Err(FetchError::ResponseTooLarge { size: len });
+    }
+
+    let bytes = resp.bytes().await?.to_vec();
+
+    // Double-check actual byte count (Content-Length can be absent or lie)
+    if bytes.len() as u64 > MAX_BLOB_SIZE {
+        return Err(FetchError::ResponseTooLarge {
+            size: bytes.len() as u64,
+        });
+    }
+
+    crate::metrics::DOWNLOADS_TOTAL.inc();
+    crate::metrics::DOWNLOADS_BYTES.inc_by(bytes.len() as u64);
+
+    if status == 206 {
+        // Partial Content — only the requested range was returned
+        Ok((bytes, None))
+    } else {
+        // 200 OK — server returned the full blob (ignored Range header)
+        Ok((bytes.clone(), Some(bytes)))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// Helper: compute SHA-256 hex digest of content.
@@ -570,5 +674,80 @@ mod tests {
             .unwrap();
         assert_eq!(bytes, content.to_vec());
         assert_eq!(expiry, None);
+    }
+
+    // --- Range request: server returns 206 with partial bytes ---
+
+    #[tokio::test]
+    async fn test_fetch_range_returns_206() {
+        let mock_server = MockServer::start().await;
+        let full_content = b"0123456789ABCDEFGHIJ"; // 20 bytes
+        let range_bytes = &full_content[5..15]; // bytes 5-14 inclusive
+
+        Mock::given(method("GET"))
+            .and(path("/range206"))
+            .and(header("Range", "bytes=5-14"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .set_body_bytes(range_bytes.to_vec())
+                    .insert_header("Content-Range", "bytes 5-14/20"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let url = format!("{}/range206", mock_server.uri());
+        let (data, full_blob) = fetch_range(&url, 5, 14).await.unwrap();
+
+        assert_eq!(data, range_bytes.to_vec());
+        assert!(
+            full_blob.is_none(),
+            "206 response should return None for full_blob"
+        );
+    }
+
+    // --- Range request: server ignores Range, returns 200 with full blob ---
+
+    #[tokio::test]
+    async fn test_fetch_range_falls_back_on_200() {
+        let mock_server = MockServer::start().await;
+        let content = b"full blob content here";
+
+        Mock::given(method("GET"))
+            .and(path("/range200"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(content.to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        let url = format!("{}/range200", mock_server.uri());
+        let (data, full_blob) = fetch_range(&url, 5, 14).await.unwrap();
+
+        assert!(
+            full_blob.is_some(),
+            "200 response should return Some for full_blob"
+        );
+        assert_eq!(full_blob.as_ref().unwrap(), &content.to_vec());
+        assert_eq!(data, content.to_vec());
+    }
+
+    // --- Range request: server returns 500 → error propagated ---
+
+    #[tokio::test]
+    async fn test_fetch_range_handles_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/rangeerr"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let url = format!("{}/rangeerr", mock_server.uri());
+        let result = fetch_range(&url, 0, 10).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            FetchError::Http(_) => {}
+            other => panic!("Expected FetchError::Http, got {other:?}"),
+        }
     }
 }
