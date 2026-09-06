@@ -294,3 +294,14 @@ echo '{"cmd":"unfreeze"}' | socat - UNIX-CONNECT:/tmp/blossomfs/blossomfs.sock
 
 `freeze` flips an `AtomicBool` that makes all write FUSE callbacks return `EROFS` at runtime
 (without remounting). Useful before backups or server maintenance.
+
+## External posting (owner directive 2026-09-06 — CHANNEL rule)
+
+Agents never post on non-member repos — no `gh` writes (issues, PRs,
+comments, reviews, gists), not even with per-text owner sign-off; the
+owner does the copy-paste into GitHub themselves. Member orgs (verify:
+`gh api user/orgs`; 2026-09-06: Amperstrand, OpenTollGate, net4sats,
+FreedomTechFeed) keep the existing owner-gate flow. Read the target
+repo CONTRIBUTING/AI policy before drafting anything upstream.
+Canonical text: lightning-playground AGENTS.md (standing rule UPDATE
+2026-09-06).
