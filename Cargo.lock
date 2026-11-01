@@ -13,6 +13,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aes"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures 0.2.17",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -322,6 +333,7 @@ dependencies = [
  "httpdate",
  "lazy_static",
  "mime_guess",
+ "nostr",
  "nostr-sdk",
  "prometheus",
  "reqwest",
@@ -1530,6 +1542,7 @@ version = "0.45.0-alpha.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96e9e406a7585380f4a398150ea81919b707b8eb969e37166a6cb17df774c534"
 dependencies = [
+ "aes",
  "base64",
  "bech32",
  "bip39",

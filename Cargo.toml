@@ -14,6 +14,9 @@ fuser = "0.17"
 
 # Nostr ecosystem
 nostr-sdk = "0.45.0-alpha.1"
+# NIP-04 (NWC payload crypto): nostr-sdk enables std/os-rng but not nip04 —
+# unify features on the same crate version it already pulls.
+nostr = { version = "0.45.0-alpha.1", default-features = false, features = ["nip04", "std", "os-rng"] }
 
 # HTTP client (for BUD-12 pagination and streaming blob fetch)
 reqwest = { version = "0.13", features = ["stream"] }
